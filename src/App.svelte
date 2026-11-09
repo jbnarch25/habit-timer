@@ -6,9 +6,10 @@
   import { cleanupOrphans, getActive } from './lib/services/sessionService';
   import ActiveTimer from './screens/ActiveTimer.svelte';
   import History from './screens/History.svelte';
-  import Home from './screens/Home.svelte';
   import SessionEditor from './screens/SessionEditor.svelte';
   import Settings from './screens/Settings.svelte';
+  import Start from './screens/Start.svelte';
+  import Tasks from './screens/Tasks.svelte';
 
   // Wrapped so "loading" (undefined) is distinguishable from "no active session".
   const active = live(async () => ({ session: await getActive() }));
@@ -25,6 +26,8 @@
     {#key $active.session.sessionId}
       <ActiveTimer active={$active.session} />
     {/key}
+  {:else if router.route.name === 'tasks'}
+    <Tasks />
   {:else if router.route.name === 'history'}
     <History />
   {:else if router.route.name === 'settings'}
@@ -34,6 +37,6 @@
       <SessionEditor id={router.route.id} fresh={router.route.fresh} />
     {/key}
   {:else}
-    <Home />
+    <Start />
   {/if}
 {/if}

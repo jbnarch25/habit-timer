@@ -16,7 +16,7 @@ beforeEach(async () => {
 describe('session lifecycle', () => {
   it('laps, pause, end', async () => {
     const dishes = await createTask({ name: 'Dishes', durationMode: 'fixed' });
-    await sessions.start({ taskId: dishes.id }, s(0));
+    await sessions.start({ taskIds: [dishes.id] }, s(0));
     await sessions.completeLap(s(60)); // dishes 60s
     await sessions.pause(s(70));
     await expect(sessions.completeLap(s(80))).rejects.toThrow();
@@ -56,7 +56,7 @@ describe('session lifecycle', () => {
 
   it('quit keeps the session flagged as discarded', async () => {
     const t = await createTask({ name: 'Laundry', durationMode: 'fixed' });
-    await sessions.start({ taskId: t.id }, s(0));
+    await sessions.start({ taskIds: [t.id] }, s(0));
     const session = await sessions.quit(s(100));
     expect(session.discarded).toBe(true);
     expect(await db.sessions.get(session.id)).toMatchObject({ discarded: true });
@@ -82,21 +82,98 @@ describe('session lifecycle', () => {
 });
 
 describe('editor', () => {
-  it('allocates, over-allocates, and marks edits', async () => {
+  it('allocates zero-sum: durations and new segments are clamped to the total', async () => {
     await sessions.start({}, s(0));
     const session = await sessions.end(s(19 * 60));
     const [only] = await editor.sessionSegments(session.id);
     expect(only.source).toBe('live');
+    expect(only.editedAt).toBeUndefined();
 
     await editor.setDuration(only.id, 9 * 60);
     expect(editor.remainderSec(session, await editor.sessionSegments(session.id))).toBe(10 * 60);
     await editor.addSegment(session.id, 7 * 60);
-    await editor.addSegment(session.id, 6 * 60);
-    const segs = await editor.sessionSegments(session.id);
-    expect(segs.map((g) => g.order)).toEqual([0, 1, 2]);
+    await editor.addSegment(session.id, 6 * 60); // only 3 min left: capped
+    expect(await editor.addSegment(session.id, 60)).toBeNull(); // nothing left
+    let segs = await editor.sessionSegments(session.id);
+    expect(segs.map((g) => g.durationSec)).toEqual([540, 420, 180]);
     expect(segs[0].source).toBe('edited');
     expect(segs[0].startedAt).toBeUndefined();
-    expect(editor.remainderSec(session, segs)).toBe(-3 * 60); // over-allocated: allowed
+    expect(editor.remainderSec(session, segs)).toBe(0);
+
+    await editor.setDuration(segs[1].id, 60 * 60); // way over: clamped to what's free (7 min)
+    segs = await editor.sessionSegments(session.id);
+    expect(segs[1].durationSec).toBe(420);
+    expect(editor.maxDurationFor(session, segs, segs[1].id)).toBe(420);
+  });
+
+  it('stamps editedAt on every kind of manual edit', async () => {
+    const t = await createTask({ name: 'Dishes', durationMode: 'flexible' });
+    await sessions.start({}, s(0));
+    await sessions.completeLap(s(60));
+    await sessions.completeLap(s(120));
+    const session = await sessions.end(s(180));
+    const [a, b, c] = await editor.sessionSegments(session.id);
+    await editor.assignTask(a.id, t.id);
+    await editor.setCompleted(b.id, false);
+    await editor.setExcluded(c.id, true);
+    for (const g of await editor.sessionSegments(session.id)) expect(typeof g.editedAt).toBe('number');
+  });
+
+  it('window delta is total minus window, none for ∞', async () => {
+    await sessions.start({ windowMin: 20 }, s(0));
+    const over = await sessions.end(s(22 * 60 + 30));
+    expect(editor.windowDeltaSec(over)).toBe(150);
+    await sessions.start({}, s(10_000));
+    expect(editor.windowDeltaSec(await sessions.end(s(10_060)))).toBeNull();
+  });
+});
+
+describe('queues and end-time windows', () => {
+  it('starts on the first task, advances through the queue, then falls back to untitled', async () => {
+    const [a, b, c] = await Promise.all(['A', 'B', 'C'].map((name) => createTask({ name, durationMode: 'fixed' })));
+    let active = await sessions.start({ taskIds: [a.id, b.id, c.id], startSource: 'picked' }, s(0));
+    expect(active.currentTaskId).toBe(a.id);
+    expect(active.queue).toEqual([b.id, c.id]);
+    active = await sessions.completeLap(s(60));
+    expect([active.currentTaskId, active.queue]).toEqual([b.id, [c.id]]);
+    active = await sessions.completeLap(s(120));
+    expect([active.currentTaskId, active.queue]).toEqual([c.id, []]);
+    active = await sessions.completeLap(s(180));
+    expect([active.currentTaskId, active.queue]).toEqual([null, []]);
+
+    // queue survives a "force-quit": it's only ever read back from the DB
+    const session = await sessions.end(s(200));
+    expect(session.plannedTaskIds).toEqual([a.id, b.id, c.id]);
+    expect(session.startSource).toBe('picked');
+    const segs = await editor.sessionSegments(session.id);
+    expect(segs.map((g) => g.taskId)).toEqual([a.id, b.id, c.id, null]);
+  });
+
+  it('a chunk-1 active row without a queue still works', async () => {
+    await db.activeSession.add({
+      sessionId: 'old',
+      startedAt: s(0),
+      startSource: 'quick',
+      currentLapStartedAt: s(0),
+      currentTaskId: null,
+      pausedAt: null,
+      pauses: [],
+      alertsFired: [],
+    });
+    const active = await sessions.completeLap(s(30));
+    expect(active.currentTaskId).toBeNull();
+    const session = await sessions.end(s(60));
+    expect(session.plannedTaskIds).toBeUndefined();
+    expect(await editor.sessionSegments('old')).toHaveLength(2);
+  });
+
+  it('derives the window from the end time at the moment of start', async () => {
+    const active = await sessions.start({ targetEndAt: s(20 * 60 + 20) }, s(0));
+    expect(active.windowMin).toBe(20);
+    expect(active.targetEndAt).toBe(s(20 * 60 + 20));
+    const session = await sessions.end(s(60));
+    expect(session.targetEndAt).toBe(s(20 * 60 + 20));
+    expect(sessions.deriveWindowMin(s(0), s(60))).toBeUndefined(); // end time already passed → ∞
   });
 });
 

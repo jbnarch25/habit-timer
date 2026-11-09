@@ -1,5 +1,6 @@
 export type Route =
   | { name: 'home' }
+  | { name: 'tasks' }
   | { name: 'history' }
   | { name: 'settings' }
   | { name: 'session'; id: string; fresh: boolean };
@@ -7,6 +8,7 @@ export type Route =
 function parse(hash: string): Route {
   const [path, query = ''] = hash.replace(/^#/, '').split('?');
   const parts = path.split('/').filter(Boolean);
+  if (parts[0] === 'tasks') return { name: 'tasks' };
   if (parts[0] === 'history') return { name: 'history' };
   if (parts[0] === 'settings') return { name: 'settings' };
   if (parts[0] === 'session' && parts[1]) {

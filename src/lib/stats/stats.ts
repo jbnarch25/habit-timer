@@ -7,6 +7,7 @@ export interface TaskStats {
   medianSec: number | null; // from history only
   sampleSize: number;
   lastDoneAt: number | null; // startedAt of the session holding the most recent completed segment
+  lastUsedAt: number | null; // startedAt of the most recent session with any segment of the task
   segmentCount: number;
   sessionCount: number;
 }
@@ -54,6 +55,7 @@ export function computeAllStats(tasks: Task[], sessions: Session[], segments: Se
       medianSec: median(qualifying.map((s) => s.durationSec)),
       sampleSize: qualifying.length,
       lastDoneAt: lastCompleted ? sessionMap.get(lastCompleted.sessionId)!.startedAt : null,
+      lastUsedAt: segs.length ? sessionMap.get(segs[segs.length - 1].sessionId)!.startedAt : null,
       segmentCount: segs.length,
       sessionCount: new Set(segs.map((s) => s.sessionId)).size,
     });
@@ -66,6 +68,32 @@ export function expectedSec(task: Task, stats: TaskStats | undefined): number | 
   if (stats?.medianSec != null) return stats.medianSec;
   if (task.durationMode === 'fixed' && task.estimateMin != null) return task.estimateMin * 60;
   return null;
+}
+
+// ---- Window fit (shared with the future picker) ----
+
+/** Typical duration in minutes: history median, else estimate, else unknown (null). */
+export function typicalMin(task: Task, stats: TaskStats | undefined): number | null {
+  if (stats?.medianSec != null) return stats.medianSec / 60;
+  return task.estimateMin ?? null;
+}
+
+export type Fit = 'fits' | 'no' | 'unknown';
+
+/** Fixed: typical ≤ W (unknown → 'unknown'). Flexible: (minMin ?? 0) ≤ W. A window with nothing left (W ≤ 0) fits nothing. */
+export function fitsWindow(task: Task, stats: TaskStats | undefined, W: number): Fit {
+  if (task.durationMode === 'fixed') {
+    const t = typicalMin(task, stats);
+    if (t == null) return 'unknown';
+    return W > 0 && t <= W ? 'fits' : 'no';
+  }
+  return W > 0 && (task.minMin ?? 0) <= W ? 'fits' : 'no';
+}
+
+/** How much of W the task would fill. Fixed: typical (0 if unknown). Flexible: min(maxMin ?? W, W). */
+export function fillMin(task: Task, stats: TaskStats | undefined, W: number): number {
+  if (task.durationMode === 'fixed') return typicalMin(task, stats) ?? 0;
+  return Math.max(0, Math.min(task.maxMin ?? W, W));
 }
 
 /** Short label for lists: "≈ 25 min", "est. 7 min", "10–30 min", "10 min+ · open-ended". */

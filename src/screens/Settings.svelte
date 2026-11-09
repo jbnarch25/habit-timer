@@ -60,7 +60,7 @@
 
 <div class="page">
   <header class="topbar">
-    <button class="icon-btn" onclick={() => navigate('/')}>‹ Home</button>
+    <button class="icon-btn" onclick={() => navigate('/')}>‹ Start</button>
     <h1>Settings</h1>
     <span style="width:44px"></span>
   </header>

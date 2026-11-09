@@ -31,6 +31,10 @@ export interface Session {
   startedAt: number;
   endedAt: number;
   windowMin?: number;
+  /** Set when the window was chosen as a clock time (chunk 2). */
+  targetEndAt?: number;
+  /** The queue as it stood at start (chunk 2). Raw data: plan vs. actual. */
+  plannedTaskIds?: string[];
   startSource: StartSource;
   pauses: Pause[];
   /** true = user quit. Kept for querying; hidden from History and excluded from stats. */
@@ -46,6 +50,8 @@ export interface Segment {
   startedAt?: number;
   completed: boolean;
   source: 'live' | 'edited';
+  /** Epoch ms of the last manual edit (chunk 2). Captured only; nothing reads it yet. */
+  editedAt?: number;
   excluded: boolean;
 }
 
@@ -53,14 +59,20 @@ export interface ActiveSession {
   sessionId: string;
   startedAt: number;
   windowMin?: number;
-  /** Not in the SPEC interface, but needed to write Session.startSource at the end. */
+  targetEndAt?: number;
+  /** Carried on the active row so finish() can write them to the Session. */
   startSource: StartSource;
+  plannedTaskIds?: string[];
   currentLapStartedAt: number;
   currentTaskId: string | null;
+  /** Remaining queued task ids; head becomes the next lap. Chunk-1 rows lack it: read via queueOf(). */
+  queue?: string[];
   pausedAt: number | null;
   pauses: Pause[];
   alertsFired: string[];
 }
+
+export const queueOf = (a: Pick<ActiveSession, 'queue'>): string[] => a.queue ?? [];
 
 export interface PickerEvent {
   id: string;

@@ -134,7 +134,24 @@ Built: data layer (all entities above except the chunk 2 fields), timestamp/paus
 
 ---
 
-## Chunk 2 — UI rework + queues (BUILD THIS NOW)
+## Chunk 2 — UI rework + queues (DONE)
+
+**Built:** two-step start sequence as the default screen (`#/`), with Tasks (`#/tasks`), History and Settings off it; window fit functions (`typicalMin`, `fitsWindow`, `fillMin`) in the stats layer plus a pure step-2 list builder (`src/lib/start/taskList.ts`); queues (start, advance on Completed task, persisted on ActiveSession, `plannedTaskIds` on Session); end-time windows (`targetEndAt`, window derived at Start); active timer re-laid out around the current segment with a secondary session timer and "Next:" line; editor window delta, zero-sum clamp, `editedAt` stamping. No Dexie schema change; chunk-1 data loads unchanged. Tests: window fit + list building, queue lifecycle, end-time derivation, chunk-1 ActiveSession rows without `queue`, editor clamp and `editedAt`.
+
+**Deviations / placeholders (decided during the build):**
+- **Wheels are native `<select>`s** (iOS renders them as scroll wheels). Placeholder for a custom wheel.
+- **End-time picker range:** 5-min slots from the first boundary ≥ now+5 min, up to now+3 h. Whichever of duration / end time was touched last decides the window; in end-time mode the duration control shows the derived "≈ N min".
+- **Tapping a row with a non-empty queue adds it to the queue** (same as "+"); it only starts immediately when the queue is empty. Start happens via the bottom bar or Start Anything. (Owner decision.)
+- **No duplicates in a queue:** queued tasks leave the list and live in the bottom bar. (Owner decision.)
+- **Remaining window is computed in queue order:** `rem -= fillMin(task, rem)` per queued task, so reordering changes it; fixed tasks without an estimate contribute 0 and are counted separately in the bar ("+k without an estimate").
+- **A full window (W ≤ 0) fits nothing**, including flexible tasks with no `minMin`.
+- **Queue bar editing:** ↑/↓/✕ per item behind an "Edit" toggle (placeholder for drag-to-reorder).
+- **Inline "+ New task" in step 2:** name + Fixed/Flexible; "Start" is offered only when the queue is empty, otherwise "Add to queue".
+- **Window marker before the first Completed task** sits under the spotlight (lap = session); afterwards it moves with the secondary session timer.
+- **Editor:** "+ Add segment" removed; the unallocated remainder row is the only way to add time. Chunk-1 sessions that were already over-allocated still display; the clamp only prevents making it worse.
+- **`ActiveSession` also carries `startSource` and `plannedTaskIds`** (not in the interface above) so they can be written to the Session at End/Quit. `startSource` was already there in chunk 1.
+- **Remaining queued tasks at End/Quit are dropped**; `plannedTaskIds` keeps the plan.
+- Untested on device: median alert re-arming for each queued task is covered by design (alert id keyed by lap start; replanned when `currentTaskId` changes), not by an automated test.
 
 All items are changes to existing chunk 1 code unless marked new.
 

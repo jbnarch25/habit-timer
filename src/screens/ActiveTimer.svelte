@@ -2,13 +2,11 @@
   import { onDestroy, onMount, untrack } from 'svelte';
   import Banner from '../components/Banner.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
-  import TaskPickerSheet from '../components/TaskPickerSheet.svelte';
   import { coalesceThresholdMs, computeRawPoints, planAlerts } from '../lib/alerts/points';
   import { alerts } from '../lib/alerts/webAlertService';
-  import { db } from '../lib/db';
   import { formatMs } from '../lib/format';
-  import { live, liveSettings, liveStats, liveTasks, taskMap } from '../lib/live';
-  import type { ActiveSession } from '../lib/model';
+  import { liveSettings, liveStats, liveTasks, taskMap } from '../lib/live';
+  import { queueOf, type ActiveSession } from '../lib/model';
   import { keepAwake } from '../lib/platform/wakeLock';
   import { navigate } from '../lib/router.svelte';
   import * as svc from '../lib/services/sessionService';
@@ -20,12 +18,9 @@
   const tasks = liveTasks();
   const stats = liveStats();
   const settings = liveSettings();
-  // svelte-ignore state_referenced_locally
-  const lapCount = live(() => db.segments.where('sessionId').equals(active.sessionId).count());
 
   let now = $state(Date.now());
   let banners = $state<string[]>([]);
-  let picking = $state(false);
   let confirmQuit = $state(false);
   let busy = false;
 
@@ -35,7 +30,12 @@
   const tasksById = $derived(taskMap($tasks));
   const currentTask = $derived(active.currentTaskId ? tasksById.get(active.currentTaskId) : undefined);
   const windowMs = $derived(active.windowMin ? active.windowMin * 60_000 : 0);
-  const lapNumber = $derived(($lapCount ?? 0) + 1);
+  // After the first "Completed task" the lap no longer equals the session.
+  const multiLap = $derived(active.currentLapStartedAt !== active.startedAt);
+  const nextTask = $derived.by(() => {
+    const id = queueOf(active)[0];
+    return id ? tasksById.get(id) : undefined;
+  });
 
   // Re-render clock. Elapsed is always recomputed from stored timestamps.
   let tick: ReturnType<typeof setInterval>;
@@ -128,38 +128,45 @@
       await svc.quit();
       navigate('/');
     });
-  const pickTask = (taskId: string | null) =>
-    act(async () => {
-      picking = false;
-      await svc.setCurrentTask(taskId);
-    });
 </script>
+
+{#snippet windowMarker()}
+  <div class="window">
+    <div class="bar"><div class="fill" class:over={sessionMs > windowMs} style:width="{Math.min(100, (sessionMs / windowMs) * 100)}%"></div></div>
+    <span class="muted small tabular">
+      {sessionMs > windowMs ? `+${formatMs(sessionMs - windowMs)} over` : `${formatMs(windowMs - sessionMs)} left`}
+      of {active.windowMin} min
+    </span>
+  </div>
+{/snippet}
 
 <!-- Any tap re-unlocks audio (needed after a reload restores a running session without a gesture). -->
 <div class="timer page" class:paused onpointerdown={() => alerts.unlock()} role="presentation">
   <header class="topbar">
-    <span class="muted small">{active.windowMin ? `${active.windowMin} min window` : ''}</span>
+    <span></span>
     <button class="icon-btn quit" onclick={() => (confirmQuit = true)} aria-label="Quit session">✕</button>
   </header>
 
   <Banner messages={banners} ondismiss={(i) => (banners = banners.filter((_, j) => j !== i))} />
 
   <section class="clock">
-    {#if paused}<div class="paused-label">Paused</div>{/if}
-    <div class="session-time tabular">{formatMs(sessionMs)}</div>
-    {#if windowMs}
-      <div class="window">
-        <div class="bar"><div class="fill" class:over={sessionMs > windowMs} style:width="{Math.min(100, (sessionMs / windowMs) * 100)}%"></div></div>
-        <span class="muted small tabular">
-          {sessionMs > windowMs ? `+${formatMs(sessionMs - windowMs)} over` : `${formatMs(windowMs - sessionMs)} left`}
-        </span>
-      </div>
-    {/if}
+    <!-- Spotlight: current segment. Fixed position; nothing above it changes size. -->
+    <div class="paused-label" class:on={paused}>Paused</div>
+    <div class="spotlight">
+      <div class="task-name" class:untitled={!currentTask}>{currentTask?.name ?? 'Untitled'}</div>
+      <div class="lap-time tabular">{formatMs(lapMs)}</div>
+    </div>
 
-    <div class="task-name" class:untitled={!currentTask}>{currentTask?.name ?? 'Untitled'}</div>
-    <div class="lap muted tabular">Lap {lapNumber} · {formatMs(lapMs)}</div>
-    {#if !currentTask && ($lapCount ?? 0) > 0}
-      <button class="link" onclick={() => (picking = true)}>Choose next task</button>
+    {#if nextTask}<div class="next muted">Next: {nextTask.name}</div>{/if}
+
+    {#if multiLap}
+      <div class="session">
+        <span class="muted tabular">Session {formatMs(sessionMs)}</span>
+        {#if windowMs}{@render windowMarker()}{/if}
+      </div>
+    {:else if windowMs}
+      <!-- lap = session: the window marker sits with the spotlight -->
+      {@render windowMarker()}
     {/if}
   </section>
 
@@ -171,10 +178,6 @@
     </div>
   </section>
 </div>
-
-{#if picking && $tasks}
-  <TaskPickerSheet tasks={$tasks} title="Next task" onpick={pickTask} onclose={() => (picking = false)} />
-{/if}
 
 {#if confirmQuit}
   <ConfirmDialog
@@ -200,18 +203,25 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
-    gap: 8px;
+    justify-content: flex-start;
+    padding-top: 10dvh;
+    gap: 12px;
     text-align: center;
   }
-  .session-time {
+  .spotlight {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .lap-time {
     font-size: clamp(64px, 22vw, 104px);
     font-weight: 200;
     letter-spacing: -0.02em;
     line-height: 1;
   }
-  .paused .session-time,
-  .paused .lap {
+  .paused .lap-time,
+  .paused .session {
     opacity: 0.45;
   }
   .paused-label {
@@ -219,7 +229,23 @@
     font-weight: 700;
     letter-spacing: 0.15em;
     text-transform: uppercase;
+    visibility: hidden; /* reserves its space so the spotlight never moves */
+  }
+  .paused-label.on {
+    visibility: visible;
     animation: pulse 1.4s ease-in-out infinite;
+  }
+  .next {
+    font-size: 17px;
+  }
+  .session {
+    margin-top: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    font-size: 18px;
+    width: 100%;
   }
   .window {
     width: min(280px, 80%);
@@ -243,16 +269,12 @@
     background: var(--danger);
   }
   .task-name {
-    margin-top: 24px;
-    font-size: 26px;
+    font-size: 28px;
     font-weight: 600;
   }
   .task-name.untitled {
     color: var(--muted);
     font-weight: 500;
-  }
-  .lap {
-    font-size: 20px;
   }
   .controls {
     display: flex;

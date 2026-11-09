@@ -40,9 +40,14 @@
     else if (target) await ed.setDuration(target.id, sec);
   }
 
-  async function addSegment() {
-    await ed.addSegment(id, remainder > 0 ? remainder : 5 * 60);
-  }
+  const delta = $derived($session ? ed.windowDeltaSec($session) : null);
+  const signed = (sec: number) => `${sec < 0 ? '−' : '+'}${formatDuration(Math.abs(sec))}`;
+
+  // Zero-sum interim clamp: a segment can take at most total − Σ other segments.
+  const durationMax = $derived.by(() => {
+    if (!editingDuration || !$session || !$segments) return 0;
+    return editingDuration === 'remainder' ? remainder : ed.maxDurationFor($session, $segments, editingDuration.id);
+  });
 
   function done() {
     navigate(fresh ? '/' : '/history');
@@ -51,7 +56,7 @@
 
 <div class="page">
   <header class="topbar">
-    <button class="icon-btn" onclick={done}>‹ {fresh ? 'Home' : 'History'}</button>
+    <button class="icon-btn" onclick={done}>‹ {fresh ? 'Start' : 'History'}</button>
     <button class="link" onclick={done}>Done</button>
   </header>
 
@@ -66,6 +71,9 @@
         {#if $session.pauses.length}· {$session.pauses.length} pause{$session.pauses.length > 1 ? 's' : ''}{/if}
       </p>
       <h1>You spent <span class="tabular">{formatDuration(total)}</span></h1>
+      {#if delta != null}
+        <p class="delta muted tabular">{signed(delta)} vs. {$session.windowMin} min window</p>
+      {/if}
       {#if $session.discarded}<p class="muted small">This session was discarded and doesn't count toward stats.</p>{/if}
     </div>
 
@@ -101,14 +109,6 @@
         </li>
       {/if}
     </ul>
-
-    {#if remainder < 0}
-      <p class="note small">
-        Allocated {formatDuration(total - remainder)} of {formatDuration(total)}. That's fine if you did things at the same time.
-      </p>
-    {/if}
-
-    <button class="btn block" onclick={addSegment}>+ Add segment</button>
   {/if}
 </div>
 
@@ -119,6 +119,7 @@
 {#if editingDuration}
   <DurationInput
     seconds={editingDuration === 'remainder' ? remainder : editingDuration.durationSec}
+    max={durationMax}
     onsave={onDuration}
     onclose={() => (editingDuration = null)}
   />
@@ -192,11 +193,8 @@
     min-height: 32px;
     font-size: 14px;
   }
-  .note {
-    color: var(--muted);
-    background: var(--surface-2);
-    border-radius: 10px;
-    padding: 10px 12px;
-    margin: 0 0 12px;
+  .summary .delta {
+    margin: 4px 0 0;
+    font-size: 16px;
   }
 </style>

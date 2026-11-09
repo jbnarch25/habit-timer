@@ -1,6 +1,6 @@
 import { db } from '../db';
 import { newId } from '../id';
-import type { ActiveSession, Segment, Session, StartSource } from '../model';
+import { queueOf, type ActiveSession, type Segment, type Session, type StartSource } from '../model';
 import { lapDurationSec } from '../time/elapsed';
 
 export const getActive = (): Promise<ActiveSession | undefined> => db.activeSession.toCollection().first();
@@ -12,21 +12,35 @@ async function requireActive(): Promise<ActiveSession> {
 }
 
 export interface StartOptions {
-  taskId?: string | null;
+  /** First task becomes the current lap; the rest are queued. Empty = untitled. */
+  taskIds?: string[];
+  /** Duration-mode window. Ignored when targetEndAt is given. */
   windowMin?: number;
+  /** End-time mode: the window is derived at this instant of starting. */
+  targetEndAt?: number;
   startSource?: StartSource;
+}
+
+/** windowMin = round((targetEndAt − start) / 1 min); ≤ 0 means no window (∞). */
+export function deriveWindowMin(targetEndAt: number, startedAt: number): number | undefined {
+  const w = Math.round((targetEndAt - startedAt) / 60_000);
+  return w > 0 ? w : undefined;
 }
 
 export async function start(opts: StartOptions = {}, now = Date.now()): Promise<ActiveSession> {
   return db.transaction('rw', db.activeSession, async () => {
     if (await db.activeSession.count()) throw new Error('A session is already running');
+    const taskIds = opts.taskIds ?? [];
     const active: ActiveSession = {
       sessionId: newId(),
       startedAt: now,
-      windowMin: opts.windowMin,
+      windowMin: opts.targetEndAt != null ? deriveWindowMin(opts.targetEndAt, now) : opts.windowMin,
+      targetEndAt: opts.targetEndAt,
       startSource: opts.startSource ?? 'quick',
+      plannedTaskIds: taskIds.length ? [...taskIds] : undefined,
       currentLapStartedAt: now,
-      currentTaskId: opts.taskId ?? null,
+      currentTaskId: taskIds[0] ?? null,
+      queue: taskIds.slice(1),
       pausedAt: null,
       pauses: [],
       alertsFired: [],
@@ -58,13 +72,14 @@ async function closeLap(active: ActiveSession, completed: boolean, now: number):
   return seg;
 }
 
-/** "Completed task": close the lap as completed; the clock keeps running with a new untitled lap. */
+/** "Completed task": close the lap as completed; the new lap takes the head of the queue, else untitled. */
 export async function completeLap(now = Date.now()): Promise<ActiveSession> {
   return db.transaction('rw', db.activeSession, db.segments, async () => {
     const active = await requireActive();
     if (active.pausedAt != null) throw new Error('Resume before completing a task');
     await closeLap(active, true, now);
-    const next: ActiveSession = { ...active, currentLapStartedAt: now, currentTaskId: null };
+    const [head = null, ...rest] = queueOf(active);
+    const next: ActiveSession = { ...active, currentLapStartedAt: now, currentTaskId: head, queue: rest };
     await db.activeSession.put(next);
     return next;
   });
@@ -128,10 +143,17 @@ async function finish(discarded: boolean, now: number): Promise<Session> {
       startedAt: active.startedAt,
       endedAt: now,
       windowMin: active.windowMin,
+      targetEndAt: active.targetEndAt,
+      plannedTaskIds: active.plannedTaskIds,
       startSource: active.startSource,
       pauses,
       discarded,
     };
+    // Drop absent optional fields so stored records stay clean.
+    if (session.targetEndAt == null) delete session.targetEndAt;
+    if (session.plannedTaskIds == null) delete session.plannedTaskIds;
+    if (session.windowMin == null) delete session.windowMin;
+    // Unstarted queue items are dropped; plannedTaskIds records the plan.
     await db.sessions.add(session);
     await db.activeSession.clear();
     return session;
