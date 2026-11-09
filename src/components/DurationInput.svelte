@@ -6,16 +6,26 @@
     title = 'Duration',
     seconds,
     max,
+    minSec = 0,
+    hint = '',
     onsave,
     onclose,
-  }: { title?: string; seconds: number; max?: number; onsave: (sec: number) => void; onclose: () => void } = $props();
+  }: {
+    title?: string;
+    seconds: number;
+    max?: number;
+    minSec?: number;
+    hint?: string;
+    onsave: (sec: number) => void;
+    onclose: () => void;
+  } = $props();
 
   // svelte-ignore state_referenced_locally
   let min = $state(Math.floor(seconds / 60));
   // svelte-ignore state_referenced_locally
   let sec = $state(seconds % 60);
 
-  const clamp = (t: number) => Math.max(0, max != null ? Math.min(max, t) : t);
+  const clamp = (t: number) => Math.max(minSec, max != null ? Math.min(max, t) : t);
   const raw = $derived((Number(min) || 0) * 60 + (Number(sec) || 0));
   const total = $derived(clamp(raw));
 
@@ -39,7 +49,7 @@
   </div>
   {#if max != null}
     <p class="max muted small" class:hit={raw > max}>
-      {raw > max ? `Capped at ${formatDuration(max)}` : `Max ${formatDuration(max)}`} (session total minus other segments)
+      {raw > max ? `Capped at ${formatDuration(max)}` : `Max ${formatDuration(max)}`}{hint ? ` · ${hint}` : ''}
     </p>
   {/if}
   <div class="row wrap bumps">

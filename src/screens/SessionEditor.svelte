@@ -1,6 +1,9 @@
 <script lang="ts">
-  import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  // Allocation editor (chunk 3): order + assignment in the log, durations in the bar.
+  import AllocationBar from '../components/AllocationBar.svelte';
   import DurationInput from '../components/DurationInput.svelte';
+  import SegmentLog from '../components/SegmentLog.svelte';
+  import Sheet from '../components/Sheet.svelte';
   import TaskPickerSheet from '../components/TaskPickerSheet.svelte';
   import { db } from '../lib/db';
   import { formatDate, formatDuration, formatTime } from '../lib/format';
@@ -14,40 +17,52 @@
   // svelte-ignore state_referenced_locally
   const session = live(async () => (await db.sessions.get(id)) ?? null);
   // svelte-ignore state_referenced_locally
-  const segments = live(() => ed.sessionSegments(id));
+  const stored = live(() => ed.sessionSegments(id));
   const tasks = liveTasks();
 
-  // Which sheet is open. 'remainder' targets the virtual unallocated row.
-  let assigning = $state<Segment | 'remainder' | null>(null);
-  let editingDuration = $state<Segment | 'remainder' | null>(null);
-  let deleting = $state<Segment | null>(null);
+  // raw: segments must never become deep proxies (IndexedDB can't clone them).
+  let assigning = $state.raw<Segment | null>(null);
+  let exact = $state.raw<Segment | null>(null);
+  let menu = $state.raw<Segment | null>(null);
 
   const tasksById = $derived(taskMap($tasks));
   const total = $derived($session ? ed.sessionTotalSec($session) : 0);
-  const remainder = $derived($session && $segments ? ed.remainderSec($session, $segments) : 0);
-
-  async function onAssign(taskId: string | null) {
-    const target = assigning;
-    assigning = null;
-    if (target === 'remainder') await ed.addSegment(id, remainder, taskId);
-    else if (target) await ed.assignTask(target.id, taskId);
-  }
-
-  async function onDuration(sec: number) {
-    const target = editingDuration;
-    editingDuration = null;
-    if (target === 'remainder') await ed.addSegment(id, sec);
-    else if (target) await ed.setDuration(target.id, sec);
-  }
-
+  // A legacy gap shows as a virtual untitled segment; it's only written with the first real edit.
+  const segs = $derived($session && $stored ? ed.withRemainder($stored, id, total) : []);
+  const length = $derived(ed.barLengthSec(segs, total));
+  const step = $derived(ed.snapStep(length));
+  const overAllocated = $derived(ed.sumSec(segs) > total);
   const delta = $derived($session ? ed.windowDeltaSec($session) : null);
   const signed = (sec: number) => `${sec < 0 ? '−' : '+'}${formatDuration(Math.abs(sec))}`;
+  const last = $derived(segs[segs.length - 1]);
 
-  // Zero-sum interim clamp: a segment can take at most total − Σ other segments.
-  const durationMax = $derived.by(() => {
-    if (!editingDuration || !$session || !$segments) return 0;
-    return editingDuration === 'remainder' ? remainder : ed.maxDurationFor($session, $segments, editingDuration.id);
-  });
+  /** Run a pure edit against the current list; persist only if something changed. */
+  async function edit(fn: (segs: Segment[], now: number) => Segment[]) {
+    const next = fn(segs, Date.now());
+    if (next !== segs) await save(next);
+  }
+
+  async function save(next: Segment[]) {
+    try {
+      await ed.applyEdit(id, next);
+    } catch (e) {
+      console.error('Saving the edit failed', e);
+    }
+  }
+
+  const current = (s: Segment | null) => (s ? segs.find((x) => x.id === s.id) : undefined);
+
+  // Sheet actions receive the segment as an argument: the template's {@const s} derives from the
+  // sheet state, so it's gone once the sheet closes.
+  function menuAction(seg: Segment, fn: (list: Segment[], now: number, seg: Segment) => Segment[]) {
+    menu = null;
+    edit((list, now) => fn(list, now, seg));
+  }
+
+  function saveExact(seg: Segment, sec: number) {
+    exact = null;
+    edit((list, now) => ed.setDurationExact(list, seg.id, sec, step, now));
+  }
 
   function done() {
     navigate(fresh ? '/' : '/history');
@@ -74,69 +89,97 @@
       {#if delta != null}
         <p class="delta muted tabular">{signed(delta)} vs. {$session.windowMin} min window</p>
       {/if}
+      {#if overAllocated}
+        <p class="muted small">
+          Older session: segments add up to {formatDuration(ed.sumSec(segs))}, more than the session's
+          {formatDuration(total)}. Edits keep this total.
+        </p>
+      {/if}
       {#if $session.discarded}<p class="muted small">This session was discarded and doesn't count toward stats.</p>{/if}
     </div>
 
-    <ul class="list">
-      {#each $segments ?? [] as seg (seg.id)}
-        {@const task = seg.taskId ? tasksById.get(seg.taskId) : undefined}
-        <li class="card seg" class:excluded={seg.excluded}>
-          <div class="row">
-            <button class="task grow" class:untitled={!task} onclick={() => (assigning = seg)}>
-              {task?.name ?? 'Untitled'}
-            </button>
-            <button class="dur tabular" onclick={() => (editingDuration = seg)}>{formatDuration(seg.durationSec)}</button>
-          </div>
-          <div class="row wrap flags">
-            <button class="chip" class:on={seg.completed} onclick={() => ed.setCompleted(seg.id, !seg.completed)}>
-              {seg.completed ? '✓ Completed' : 'Unfinished'}
-            </button>
-            <button class="chip" class:on={seg.excluded} onclick={() => ed.setExcluded(seg.id, !seg.excluded)}>
-              {seg.excluded ? 'Excluded from stats' : 'Exclude'}
-            </button>
-            <span class="grow"></span>
-            <button class="icon-btn" onclick={() => (deleting = seg)} aria-label="Delete segment">🗑</button>
-          </div>
-        </li>
-      {/each}
+    <SegmentLog
+      {segs}
+      {tasksById}
+      canEditDuration={segs.length > 1}
+      onreorder={(from, to) => edit((s, now) => ed.reorder(s, from, to, now))}
+      onassign={(s) => (assigning = s)}
+      onduration={(s) => (exact = s)}
+      onmenu={(s) => (menu = s)}
+    />
 
-      {#if remainder > 0}
-        <li class="card seg remainder">
-          <div class="row">
-            <button class="task grow untitled" onclick={() => (assigning = 'remainder')}>Untitled · unallocated</button>
-            <button class="dur tabular" onclick={() => (editingDuration = 'remainder')}>{formatDuration(remainder)}</button>
-          </div>
-        </li>
-      {/if}
-    </ul>
+    <button
+      class="btn block add"
+      disabled={!last || !ed.canSplit(last, step)}
+      onclick={() => edit((s, now) => ed.splitSegment(s, last.id, step, now))}
+    >
+      + Add
+    </button>
+
+    <AllocationBar {segs} {step} {tasksById} oncommit={save} />
+    <p class="muted small hint">
+      Drag the dividers to move time between neighbors ({step === 60 ? '1-minute' : '5-second'} steps). Tap a time
+      in the list for exact values.
+    </p>
   {/if}
 </div>
 
 {#if assigning && $tasks}
-  <TaskPickerSheet tasks={$tasks} title="Assign task" onpick={onAssign} onclose={() => (assigning = null)} />
-{/if}
-
-{#if editingDuration}
-  <DurationInput
-    seconds={editingDuration === 'remainder' ? remainder : editingDuration.durationSec}
-    max={durationMax}
-    onsave={onDuration}
-    onclose={() => (editingDuration = null)}
-  />
-{/if}
-
-{#if deleting}
-  <ConfirmDialog
-    message="Delete this {formatDuration(deleting.durationSec)} segment?"
-    confirmLabel="Delete"
-    danger
-    onconfirm={async () => {
-      const d = deleting!;
-      deleting = null;
-      await ed.deleteSegment(d.id);
+  <TaskPickerSheet
+    tasks={$tasks}
+    title="Assign task"
+    onpick={(taskId) => {
+      const s = assigning!;
+      assigning = null;
+      edit((list, now) => ed.assign(list, s.id, taskId, now));
     }}
-    oncancel={() => (deleting = null)}
+    onclose={() => (assigning = null)}
   />
+{/if}
+
+{#if exact}
+  {@const s = current(exact)}
+  {#if s}
+    <DurationInput
+      title="Exact duration"
+      seconds={s.durationSec}
+      minSec={1}
+      max={ed.maxExactSec(segs, s.id, step)}
+      hint={s === last ? 'taken from the segment above' : 'taken from the next segment'}
+      onsave={(sec) => saveExact(s, sec)}
+      onclose={() => (exact = null)}
+    />
+  {/if}
+{/if}
+
+{#if menu}
+  {@const s = current(menu)}
+  {#if s}
+    <Sheet title={s.taskId ? (tasksById.get(s.taskId)?.name ?? 'Segment') : 'Untitled'} onclose={() => (menu = null)}>
+      <div class="actions">
+        <button
+          class="btn block"
+          disabled={!ed.canSplit(s, step)}
+          onclick={() => menuAction(s, (l, now, x) => ed.splitSegment(l, x.id, step, now))}
+        >
+          Split in half{ed.canSplit(s, step) ? '' : ' (too short)'}
+        </button>
+        <button class="btn block" onclick={() => menuAction(s, (l, now, x) => ed.setCompleted(l, x.id, !x.completed, now))}>
+          {s.completed ? 'Mark unfinished' : 'Mark completed'}
+        </button>
+        <button class="btn block" onclick={() => menuAction(s, (l, now, x) => ed.setExcluded(l, x.id, !x.excluded, now))}>
+          {s.excluded ? 'Include in stats' : 'Exclude from stats'}
+        </button>
+        <button
+          class="btn block danger"
+          disabled={!ed.canDelete(segs, s)}
+          onclick={() => menuAction(s, (l, now, x) => ed.deleteSegment(l, x.id, now))}
+        >
+          {s.taskId ? 'Delete (unassign, keep time)' : segs.indexOf(s) === 0 ? 'Delete (merge into next)' : 'Delete (merge into above)'}
+        </button>
+      </div>
+    </Sheet>
+  {/if}
 {/if}
 
 <style>
@@ -146,55 +189,23 @@
   .summary p {
     margin: 0 0 4px;
   }
+  .summary .delta {
+    margin-top: 4px;
+    font-size: 16px;
+  }
   h1 {
     font-size: 26px;
   }
-  .list {
-    list-style: none;
-    margin: 0 0 12px;
-    padding: 0;
+  .add {
+    margin: 8px 0 20px;
+  }
+  .hint {
+    margin: -6px 4px 0;
+    line-height: 1.4;
+  }
+  .actions {
     display: flex;
     flex-direction: column;
     gap: 8px;
-  }
-  .seg {
-    padding: 6px 8px 8px 14px;
-  }
-  .seg.excluded {
-    opacity: 0.6;
-  }
-  .remainder {
-    border-style: dashed;
-    background: transparent;
-  }
-  .task {
-    min-height: 44px;
-    text-align: left;
-    font-size: 17px;
-    font-weight: 500;
-  }
-  .untitled {
-    color: var(--muted);
-    font-weight: 400;
-  }
-  .dur {
-    min-height: 44px;
-    min-width: 72px;
-    font-size: 19px;
-    font-weight: 600;
-    border-radius: 10px;
-    background: var(--surface-2);
-    padding: 0 10px;
-  }
-  .flags {
-    margin-top: 4px;
-  }
-  .flags .chip {
-    min-height: 32px;
-    font-size: 14px;
-  }
-  .summary .delta {
-    margin: 4px 0 0;
-    font-size: 16px;
   }
 </style>

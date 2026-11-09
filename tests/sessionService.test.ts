@@ -34,7 +34,7 @@ describe('session lifecycle', () => {
       [null, 20, false],
     ]);
     expect(editor.sessionTotalSec(session)).toBe(120);
-    expect(editor.remainderSec(session, segs)).toBe(0);
+    expect(editor.sumSec(segs)).toBe(120); // live laps cover the total exactly
   });
 
   it('survives a "reload": state comes only from the DB', async () => {
@@ -82,41 +82,49 @@ describe('session lifecycle', () => {
 });
 
 describe('editor', () => {
-  it('allocates zero-sum: durations and new segments are clamped to the total', async () => {
+  it('applyEdit persists splits, drags, reorders and deletes', async () => {
     await sessions.start({}, s(0));
     const session = await sessions.end(s(19 * 60));
-    const [only] = await editor.sessionSegments(session.id);
-    expect(only.source).toBe('live');
-    expect(only.editedAt).toBeUndefined();
-
-    await editor.setDuration(only.id, 9 * 60);
-    expect(editor.remainderSec(session, await editor.sessionSegments(session.id))).toBe(10 * 60);
-    await editor.addSegment(session.id, 7 * 60);
-    await editor.addSegment(session.id, 6 * 60); // only 3 min left: capped
-    expect(await editor.addSegment(session.id, 60)).toBeNull(); // nothing left
     let segs = await editor.sessionSegments(session.id);
-    expect(segs.map((g) => g.durationSec)).toEqual([540, 420, 180]);
-    expect(segs[0].source).toBe('edited');
-    expect(segs[0].startedAt).toBeUndefined();
-    expect(editor.remainderSec(session, segs)).toBe(0);
+    expect(segs[0]).toMatchObject({ source: 'live' });
 
-    await editor.setDuration(segs[1].id, 60 * 60); // way over: clamped to what's free (7 min)
-    segs = await editor.sessionSegments(session.id);
-    expect(segs[1].durationSec).toBe(420);
-    expect(editor.maxDurationFor(session, segs, segs[1].id)).toBe(420);
+    const step = editor.snapStep(editor.barLengthSec(segs, editor.sessionTotalSec(session)));
+    segs = editor.splitSegment(segs, segs[0].id, step, 1);
+    segs = editor.moveDivider(segs, 0, 9 * 60, step, 2);
+    await editor.applyEdit(session.id, segs);
+    let stored = await editor.sessionSegments(session.id);
+    expect(stored.map((g) => g.durationSec)).toEqual([540, 600]);
+    expect(stored[0].startedAt).toBe(s(0)); // kept on duration edits (chunk 3)
+
+    stored = editor.reorder(stored, 1, 0, 3);
+    await editor.applyEdit(session.id, stored);
+    stored = await editor.sessionSegments(session.id);
+    expect(stored.map((g) => g.durationSec)).toEqual([600, 540]);
+
+    stored = editor.deleteSegment(stored, stored[0].id, 4); // untitled first → merges below
+    await editor.applyEdit(session.id, stored);
+    stored = await editor.sessionSegments(session.id);
+    expect(stored.map((g) => [g.durationSec, g.order])).toEqual([[1140, 0]]);
   });
 
-  it('stamps editedAt on every kind of manual edit', async () => {
-    const t = await createTask({ name: 'Dishes', durationMode: 'flexible' });
+  it('a legacy remainder is virtual: nothing is written until the first real edit', async () => {
     await sessions.start({}, s(0));
-    await sessions.completeLap(s(60));
-    await sessions.completeLap(s(120));
-    const session = await sessions.end(s(180));
-    const [a, b, c] = await editor.sessionSegments(session.id);
-    await editor.assignTask(a.id, t.id);
-    await editor.setCompleted(b.id, false);
-    await editor.setExcluded(c.id, true);
-    for (const g of await editor.sessionSegments(session.id)) expect(typeof g.editedAt).toBe('number');
+    const session = await sessions.end(s(600));
+    const [only] = await editor.sessionSegments(session.id);
+    await db.segments.update(only.id, { durationSec: 400 }); // simulate a chunk-1 short session
+    const total = editor.sessionTotalSec(session);
+
+    const shown = editor.withRemainder(await editor.sessionSegments(session.id), session.id, total);
+    expect(shown.map((g) => g.durationSec)).toEqual([400, 200]);
+    expect(await editor.sessionSegments(session.id)).toHaveLength(1); // viewing wrote nothing
+
+    const t = await createTask({ name: 'Dishes', durationMode: 'flexible' });
+    await editor.applyEdit(session.id, editor.assign(shown, shown[0].id, t.id, 7));
+    const stored = await editor.sessionSegments(session.id);
+    expect(stored).toHaveLength(2);
+    expect(stored[1]).toMatchObject({ taskId: null, durationSec: 200, source: 'edited' });
+    expect(editor.isVirtual(stored[1])).toBe(false);
+    expect(stored[0]).toMatchObject({ taskId: t.id, source: 'live', editedAt: 7 });
   });
 
   it('window delta is total minus window, none for ∞', async () => {

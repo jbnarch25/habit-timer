@@ -201,7 +201,23 @@ The start sequence is the app's default screen (where the app opens and where Qu
 
 ---
 
-## Chunk 3 — Allocation editor (BUILD THIS NOW)
+## Chunk 3 — Allocation editor (DONE)
+
+**Built:** session editor rebuilt as header + log + allocation bar. Zero-sum logic is pure and unit-tested in `editorService` (`moveDivider`, `setDurationExact`, `splitSegment`, `deleteSegment`, `reorder`, `assign`/toggles, `withRemainder`, `barLengthSec`, `snapStep`), persisted through a single `applyEdit` diff/transaction. New components: `SegmentLog` (hand-rolled pointer-event reorder, row menu), `AllocationBar` (hand-rolled divider drag, minimum block width). The chunk 2 clamp, remainder row and over-allocation paths are removed. No schema change. Tests: every edit function, the 19:00 → 9/7/3 scenario, a 200-op randomized zero-sum invariant, virtual remainder persistence; headless browser run of drags, reorder, delete rules, tiny segments and no-write-on-view.
+
+**Deviations / decisions (owner answers during planning unless noted):**
+- **`source: 'edited'` only on duration changes.** Assign, reorder and completed/excluded toggles stamp `editedAt` but keep `source` (it means measured vs. allocated).
+- **`startedAt` is kept on duration edits** (overrides the chunk 1 "edited segments have no `startedAt`" rule). New segments from Split have none.
+- **Snapping is in duration terms:** a divider drag snaps the left segment's duration to a step multiple (9:37 → 9:00 / 10:00); the right neighbor takes the difference and keeps odd seconds. If the right neighbor's minimum blocks the snap, the left stops at the clamp.
+- **Minimum size = min(current size, one step):** a sub-step segment can grow by drag but never shrink; shrinking only via exact input.
+- **Exact input:** unsnapped seconds, own minimum 1 s (my choice; typing never deletes), neighbor clamped at min(its size, one step). The only segment's duration can't be edited (total is fixed).
+- **Split:** exact halves (the original keeps the odd second), new untitled half `completed: true`, `excluded: false`. Disabled under 2 steps. Because **+** splits the last segment, **+ is disabled when the last segment is under 2 steps** (consequence, not separately specified).
+- **Delete on a single named segment unassigns it**; only the untitled-merge case is refused.
+- **Unallocated remainder is virtual** (replaces "materialize when opened"): shown as an untitled block/row, written (`source: 'edited'`) only with the first real edit to that session. Viewing writes nothing.
+- **Drag:** hand-rolled pointer events for both log reorder (⠿ handle) and bar dividers, `touch-action: none` on handles only.
+- **Row actions** are a "⋯" sheet (Split, Completed, Excluded, Delete with a label saying what it will do). Placeholder for swipe.
+- **Block colors are derived from the task id** (hash → hue), untitled is neutral grey. Placeholder; no stored field.
+- Legacy over-allocated sessions: bar length = segment sum, header note; no migration.
 
 Replaces the chunk 2 interim clamp in the session editor. Separation of concerns: **order and assignment live in the log; durations live in the allocation bar.**
 
