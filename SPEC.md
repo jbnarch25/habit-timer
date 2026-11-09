@@ -201,8 +201,55 @@ The start sequence is the app's default screen (where the app opens and where Qu
 
 ---
 
+## Chunk 3 — Allocation editor (PLANNED, next after chunk 2)
+
+Replaces the chunk 2 interim clamp in the session editor. Separation of concerns: **order and assignment live in the log; durations live in the allocation bar.**
+
+### Log (top)
+- A list of the session's segments in `order`, each row showing task name (or "Untitled") and duration.
+- **Assignment:** tapping the task name opens a task-selection sheet with a search field (reuse/extend `TaskPickerSheet`). Typing filters tasks; when nothing matches, offer "Create '<query>'" to create the task inline and assign it.
+- **Reorder:** drag rows to change `order`. The allocation bar follows log order.
+- **Row actions** (swipe or small row menu, kept out of the way): Split, Completed toggle, Excluded toggle, Delete.
+- **Precise duration fallback:** tapping a row's duration opens a numeric input for fine edits. The bar is the primary way to change durations; this is the escape hatch for tiny segments and exact values. Changes are zero-sum: time taken from or given to the next segment (or previous, if last).
+- **Add (+)** at the bottom of the log: adds an untitled segment by splitting the last segment in half. The row-menu Split does the same for that row (new untitled segment inserted right after it).
+
+### Allocation bar (bottom)
+- A horizontal bar representing the session total, divided into blocks in log order. This is an allocation view, NOT a chronological timeline; label and treat it that way.
+- **Dividers** between adjacent blocks are draggable. Moving one transfers time between the two neighbors only, so the total never changes and over-allocation is impossible by construction. Remove the chunk 2 clamp and remainder pool: untitled time is simply an untitled segment.
+- **Snapping:** dividers move in steps. Interim rule until per-task snap increments exist: 1-minute steps; 5-second steps for sessions under 5 minutes.
+- **Minimum size:** a segment can't be dragged below one snap step. Dragging never deletes.
+- **Small segments:** blocks have a minimum visual width so every divider stays grabbable (the bar may be slightly non-proportional). The log's numeric input covers precision.
+- Each block shows its task name/color where width allows; the selected/dragged pair is highlighted.
+
+### Delete
+- Deleting a **named** segment unassigns it (becomes untitled in place); the time stays visible.
+- Deleting an **untitled** segment merges its time into the segment above it (below, if it's first).
+- Deleting the only segment isn't possible.
+
+### Data
+- Any duration, task, order, completed or excluded change sets `source: 'edited'` and `editedAt` = now on each affected segment (both neighbors on a divider drag).
+- Live segments keep their `startedAt` even when reordered; the bar does not imply chronology.
+
+### Existing data (from chunks 1–2)
+- Sessions with an unallocated remainder (segments sum < total): when opened in the editor, materialize the remainder as an untitled segment at the end (`source: 'edited'`, `editedAt` = now), so the bar always covers the full total. Remove the remainder row.
+- Legacy over-allocated sessions (chunk 1 test data, segments sum > total): the bar uses the segment sum as its length and the header notes the mismatch. Edits stay zero-sum from there. No migration.
+- Remove the chunk 2 clamp once the bar and the zero-sum numeric input replace it.
+
+### Implementation notes
+- iOS Safari: drag reorder and divider drag need pointer events with `touch-action: none` on the drag handles, or a touch-capable library (e.g. `svelte-dnd-action` for the list). Test on the phone early.
+- Keep zero-sum transfer logic in `editorService` (pure functions, unit-tested): `moveDivider`, `splitSegment`, `deleteSegment`, `setDurationExact`.
+
+### Acceptance criteria
+- A single untitled 19:00 session can be turned into dishes 9 / laundry 7 / stretching 3 using + and divider drags, without typing.
+- The session total never changes during any edit; no over-allocation state is reachable.
+- Reordering the log reorders the bar.
+- A 30-second segment in a 60-minute session is still grabbable and editable.
+- Delete follows the named/untitled rules above.
+- Works by touch on a real iPhone.
+
+---
+
 ## Open UI questions (not buildable yet)
-- **Allocation UX** in the editor: how the zero-sum constraint feels in use (remainder pool, splitting, input method). Replaces the chunk 2 interim clamp.
 - **Duration resolution per task** (decided in principle, needs a field + allocation UX first): storage stays to the second; each task sets a snap increment for display/editing (e.g. dishes to the minute, exercise to the second); needs a Task field, e.g. `snapSec?: number`. The live stopwatch always shows seconds; resolution applies to the editor, History and stats. Untitled segments default to 1 min. **Leftover seconds** (snapped segments vs. exact total) go to one absorber segment: the last unedited segment in order; if every segment has been edited, the one edited longest ago (via `editedAt`). The absorber stores exact seconds; display rounds to its task's increment.
 
 ---
