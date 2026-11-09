@@ -201,7 +201,7 @@ The start sequence is the app's default screen (where the app opens and where Qu
 
 ---
 
-## Chunk 3 — Allocation editor (PLANNED, next after chunk 2)
+## Chunk 3 — Allocation editor (BUILD THIS NOW)
 
 Replaces the chunk 2 interim clamp in the session editor. Separation of concerns: **order and assignment live in the log; durations live in the allocation bar.**
 
