@@ -2,6 +2,8 @@
 
 Personal-use PWA for iPhone (installed to home screen). Single user, no accounts, no backend.
 
+**How this spec is organized:** the reference sections (data model, stats, alerts, export) describe the system as it should be. Chunk sections describe work: **DONE** = built, **BUILD THIS NOW** = in flight (written as changes to what exists), **PLANNED** = decided but not scheduled. Open questions are not buildable until resolved.
+
 ## Purpose
 
 Deciding *what* to do with a chunk of time is the hard part of chores, cooking, exercise, hobbies. This app:
@@ -10,23 +12,21 @@ Deciding *what* to do with a chunk of time is the hard part of chores, cooking, 
 
 ## Design principles (apply to every UI decision)
 
-- **Reduce friction above all.** The fastest path is one tap: start the stopwatch, figure out the rest later.
-- **Progressive disclosure.** The default UI is the simple single-task case. Advanced features (multi-task sessions, editing, extra task options) are available but quiet, never in the way.
-- **Single focus.** During an active segment, show only the current task. Choosing or adding the next thing becomes available after "Completed task," not before.
+- **Reduce friction above all.** The fastest path is two taps: Next (window defaults to ∞) → Start Anything. Start the stopwatch, figure out the rest later.
+- **Progressive disclosure.** The default UI is the simple single-task case. Advanced features (queues, editing, extra task options) are available but quiet, never in the way.
+- **Single focus, minimal interaction mid-session.** During an active segment, show only the current task (plus a quiet "Next up" when a queue exists). No task selection, skipping or reordering mid-session; fix things in review.
 - **Capture raw data generously, derive everything else.** Store timestamps, durations and events whenever they're known, even without a current use. Never store computed stats (medians, last done, staleness); compute them on read.
 
 ---
 
-## Chunk 1 — Foundation (BUILD THIS NOW)
-
-### Stack
+## Stack
 - Vite + TypeScript + Svelte
 - `vite-plugin-pwa` for manifest + service worker (offline-capable, installable)
-- IndexedDB via Dexie. Call `navigator.storage.persist()` on first launch to request durable storage.
-- Static hosting (Cloudflare Pages or GitHub Pages; HTTPS required for install)
-- Mobile-first, iPhone portrait, respect safe-area insets, dark mode via `prefers-color-scheme`
+- IndexedDB via Dexie. `navigator.storage.persist()` requested on first launch.
+- Hosting: GitHub Pages (public repo), deployed via GitHub Actions on push to `main`. Vite `base` and the PWA manifest `start_url`/`scope` match the `/<repo-name>/` path; hash routing.
+- Mobile-first, iPhone portrait, safe-area insets, dark mode via `prefers-color-scheme`
 
-### Data model
+## Data model
 Entities are plain records (TS interfaces). Logic lives in separate functions/services, not on the stored objects. Records reference each other by ID; never embed copies.
 
 ```ts
@@ -52,8 +52,10 @@ Session {                           // one continuous stopwatch run
   id: string
   startedAt: number                 // epoch ms
   endedAt: number                   // epoch ms
-  windowMin?: number                // target window chosen at start, if any
-  startSource: 'quick' | 'picked' | 'suggested'   // 'quick' only in chunk 1
+  windowMin?: number                // target window, if any (absent = ∞)
+  targetEndAt?: number              // NEW (chunk 2): set when the window was chosen as a clock time
+  plannedTaskIds?: string[]         // NEW (chunk 2): the queue as it stood at start. Raw data: plan vs. actual
+  startSource: 'quick' | 'picked' | 'suggested'
   pauses: { startedAt: number, endedAt: number }[]  // raw pause log
   discarded: boolean                // true = user quit (X). Kept for later querying (e.g. tasks bailed on),
                                     // hidden from History and excluded from all derived stats.
@@ -68,6 +70,7 @@ Segment {                           // a lap within a session: time spent on one
   startedAt?: number                // recorded for live laps; absent for editor-created segments
   completed: boolean                // true = "Completed task"; false = session ended mid-task
   source: 'live' | 'edited'         // measured vs. after-the-fact allocation
+  editedAt?: number                 // NEW (chunk 2): epoch ms of last manual edit (raw data; used later by snap/absorber logic)
   excluded: boolean                 // user excludes from stats
 }
 
@@ -75,83 +78,122 @@ ActiveSession {                     // at most one; persisted so app kill/reload
   sessionId: string
   startedAt: number
   windowMin?: number
+  targetEndAt?: number              // NEW (chunk 2)
   currentLapStartedAt: number
   currentTaskId: string | null
+  queue: string[]                   // NEW (chunk 2): remaining queued task ids; head becomes the next lap.
+                                    // A persisted row without this field is treated as [].
   pausedAt: number | null           // non-null while paused
   pauses: { startedAt: number, endedAt: number }[]  // completed pauses so far
   alertsFired: string[]             // alert point ids already announced
 }
 
-// Reserve for the picker chunk (create the table, nothing writes to it yet):
+// Reserved for the picker chunk (table exists, nothing writes to it yet):
 PickerEvent { id, at, windowMin, suggestedTaskIds: string[], action: 'accepted' | 'rerolled' | 'dismissed', chosenTaskId? }
 ```
 
-Elapsed time is ALWAYS computed from stored timestamps: `(now or pausedAt) - startedAt - total paused time` (for lap time, count only pause time after the lap start). Never accumulate ticks. Segment `durationSec` and session totals exclude paused time.
-Concurrency is NOT modeled live. It's handled by allocation in the editor (see below).
+All chunk 2 fields are optional/unindexed: no Dexie index changes, no data migration, existing data survives.
 
-### Stats (derived on read)
-- **Median per task**: median `durationSec` of the last 10 qualifying segments. Qualifying = session not discarded, not excluded, ≥ 30s, and for fixed tasks `completed === true` (an unfinished fixed task isn't a real duration).
+Elapsed time is ALWAYS computed from stored timestamps: `(now or pausedAt) - startedAt - total paused time` (for lap time, count only pause time after the lap start). Never accumulate ticks. Segment `durationSec` and session totals exclude paused time.
+Concurrency is NOT modeled live or by overlapping segments. The user splits a session's total time across tasks in the editor; segments never sum to more than the session total. Each segment has one unambiguous duration.
+
+## Stats (derived on read)
+- **Median per task**: median `durationSec` of the last 10 qualifying segments. Qualifying = session not discarded, not excluded, ≥ 30s, and for fixed tasks `completed === true`.
 - No history → fixed: fall back to `estimateMin`; flexible: show range (`minMin`–`maxMin` / "open-ended").
 - **Last done**: most recent completed segment for the task (via its session's date). Also show session/segment count.
+- **Window fit** (shared functions in the stats layer; the picker chunk will reuse them):
+  - `typicalMin(task)` = median, else `estimateMin`, else unknown.
+  - `fitsWindow(task, W)`: fixed → `typicalMin ≤ W`; flexible → `(minMin ?? 0) ≤ W`. Unknown fixed duration → "no estimate" (neither fits nor fails).
+  - `fillMin(task, W)`: fixed → `typicalMin`; flexible → `min(maxMin ?? W, W)`.
 
-### Session flow (active timer screen)
-- **Start**: one-tap quick start with no task (untitled stopwatch), OR pick/create a task first. Optional window picker (presets 10/15/20/30/45/60 + custom), kept out of the way.
-- **Display**: large elapsed session time, current task name (or "Untitled"), current lap time, window marker.
-Four controls, in order of prominence:
-1. **Completed task** (primary): closes the current segment (`completed: true`, `source: 'live'`, `startedAt` = lap start), clock keeps running, a new untitled lap begins. Only now is "choose next task" offered (optional; can stay untitled). Rapid taps are allowed: rack up several untitled laps and name them afterward.
-2. **Pause / Resume**: a distraction came up. Freezes session and lap clocks; alerts don't fire while paused and are rescheduled on resume. Paused state is visually obvious. Pauses are logged on the session.
-3. **End session**: closes the current segment as `completed: false`, ends the session, opens the session review/editor.
-4. **Quit (X)**: bail out. Confirmation dialog ("Discard this session? 12:34 won't count."). On confirm, close the current segment as `completed: false`, save the session with `discarded: true` (not deleted), cancel alerts, release wake lock, return to the default start state. Discarded sessions and their segments are hidden from History and excluded from all stats, but kept in the data and in export. Less prominent than the others (e.g. corner X).
-
-### Session editor (allocation, not timeline)
-Works in durations. The user never types timestamps.
-- Shows total session time ("You spent 19:00") and the list of segments.
-- Assign a segment to a task, or create a new task inline.
-- Edit a segment's duration; add a new segment (e.g. split 19:00 into dishes 9, laundry 7, stretching 3). Edited/created segments get `source: 'edited'` and no `startedAt`.
-- Any unallocated remainder shows as an untitled segment.
-- Allocations summing to MORE than the total is allowed (this is how concurrency is represented); show a soft note, not an error.
-- Toggle completed, toggle excluded, delete a segment.
-- Same editor is reachable later from History.
-
-### Screens
-1. **Home / Tasks**: big quick-start button; task list (name, median or range, last done); tap a task to start with it; add/edit/archive. Advanced task fields (mode details, frequency, preferred times) behind "More options."
-2. **Active timer**: as above. Screen stays on.
-3. **Session editor**: as above.
-4. **History**: sessions by date with their segments; open in editor.
-5. **Settings**: export/import, alert preferences, wake lock toggle.
-
-### Alerts (audio/voice, not push notifications)
+## Alerts (audio/voice, not push notifications)
 iOS suspends PWA JavaScript when backgrounded or locked, so:
-- **Screen Wake Lock** (`navigator.wakeLock`) during an active session, ON by default. Keeping the timer visible on screen is a feature. Re-acquire on `visibilitychange`. Feature-detect; degrade quietly.
-- **Beep** via Web Audio + **spoken announcement** via `speechSynthesis` using iOS system voices ("Twenty minutes. Dishes usually takes twenty-five."). Unlock both inside the Start tap (iOS requires a user gesture).
+- **Screen Wake Lock** during an active session, ON by default. Re-acquire on `visibilitychange`. Feature-detect; degrade quietly.
+- **Beep** via Web Audio + **spoken announcement** via `speechSynthesis` (iOS system voices). Unlocked inside the Start tap.
 - If the app resumes after an alert point passed while backgrounded, show a visual banner; don't play a stale alert.
 - All behind an `AlertService` interface (`schedule(points)`, `cancel()`).
 
 Alert points:
 - **Window** (session-level): at `windowMin` of session time, if a window was set.
-- **Median** (segment-level): for the current segment's task, only if `task.medianAlert` is true and a median/estimate exists. Measured from the lap start (excluding pauses). Re-armed each time a new segment begins.
+- **Median** (segment-level): for the current segment's task, only if `task.medianAlert` is true and a median/estimate exists. Measured from the lap start (excluding pauses). Re-armed each time a new segment begins (including when a queued task becomes current).
 - **Coalescing:** if two points fall within `max(2 min, 15% of window)` of each other, fire ONE combined announcement at the earlier time. Thresholds are settings.
-- Settings: beep on/off, voice on/off, voice selection (`speechSynthesis.getVoices()`), coalescing thresholds.
+- Settings: beep on/off, voice on/off, voice selection, coalescing thresholds.
 
-### Export / import
-- JSON: `{ schemaVersion: 1, exportedAt, tasks, sessions, segments, pickerEvents }`.
+## Export / import
+- JSON: `{ schemaVersion: 1, exportedAt, tasks, sessions, segments, pickerEvents }`. New optional fields ride along; older files import fine.
 - Import: replace-all with confirmation.
 - Export via share sheet (`navigator.share` with file), falling back to download.
 
-### Acceptance criteria
-- Installs to iPhone home screen and runs standalone and offline.
-- Quick-start an untitled session, force-quit, reopen → still running with correct elapsed time.
-- "Completed task" creates laps while the clock keeps running; End session opens the editor.
-- Pause freezes both clocks (also across force-quit while paused); paused time is excluded from durations and alerts shift accordingly.
-- Quit asks for confirmation, then the session is saved as discarded: absent from History and stats, still present in export.
-- In the editor: allocate a session's time across several tasks, create a task inline, over-allocate with only a soft warning.
-- With the screen awake, beep + voice fire at the window and at the current task's median; close points coalesce.
-- Medians update correctly; excluded and unfinished fixed segments don't count.
-- Export → wipe data → import restores everything.
+---
+
+## Chunk 1 — Foundation (DONE)
+
+Built: data layer (all entities above except the chunk 2 fields), timestamp/pause math, session controls (Completed task, Pause/Resume, End, Quit-as-discarded), session editor, History, Settings, stats/medians, alerts with coalescing, wake lock, export/import, PWA install/offline, GitHub Pages deploy. Tests cover elapsed math, alert points, session service, stats.
+
+**The screens and flows built in chunk 1 are functional placeholders.** Chunk 2 replaces the start flow, active timer layout and parts of the editor. Keep the services, data layer and alert logic.
 
 ---
 
-## Later chunks (DO NOT BUILD YET — design in progress)
-- **Picker:** given a window, filter tasks that fit (fixed: median/estimate ≤ window; flexible: `minMin` ≤ window), rank by staleness (time since last completed segment relative to `targetFrequencyDays`; partial progress may count partially), weighted random. Possible extra signals: `preferredTimes` / learned time-of-day from segment `startedAt`, reroll/skip history from `PickerEvent`. "Choose for me" = one pick + reroll. "Show options" = max 3. Picking starts the session with that window and task, `startSource` set accordingly.
+## Chunk 2 — UI rework + queues (BUILD THIS NOW)
+
+All items are changes to existing chunk 1 code unless marked new.
+
+### 2.1 Start sequence (replaces the Home Start button + WindowPicker presets)
+The start sequence is the app's default screen (where the app opens and where Quit/End-review return to). Tasks, History and Settings are reached from navigation off it.
+
+**Step 1: window.** Reads "Start a [∞] session, ending at [h:mm]".
+- Duration is a scroll wheel: default **∞** (no window), then 5–120 min in 5-min steps.
+- Picking a duration updates "ending at" (preview only). With ∞, "ending at" shows "…".
+- The end time is also a picker (5-min steps). Choosing an end time sets `targetEndAt`; the window is derived **at the moment Start is tapped**: `windowMin = round((targetEndAt − startedAt) / 60000)`. If that's ≤ 0, treat as ∞.
+- **Next** → step 2.
+
+**Step 2: task.** A list for window W (W = remaining window, see queue below):
+- **Top row, always: "Start Anything"** → starts untitled (or with the queue, if one is built).
+- **Fits group:** non-archived tasks where `fitsWindow(task, W)`, sorted by `fillMin(task, W)` descending (biggest fill first; short tasks fall to the bottom). Ties: least recently done first.
+- **"No estimate" group** at the bottom: fixed tasks with no median and no estimate.
+- **∞ window:** no filtering; all non-archived tasks sorted by most recently used.
+- **"+ New task"** at the bottom: create inline, then start with it (or queue it).
+- **Tap a row** → start immediately with that single task (`startSource: 'picked'`).
+- **"+" on a row** → add to the queue instead (new):
+  - Once the queue is non-empty, W becomes `windowMin − Σ fillMin(queued)` and the list re-filters/re-sorts against it. (∞ stays unfiltered.)
+  - A bottom bar appears: "Start N tasks · X of W min" (or "Start N tasks" for ∞). Queued items can be reordered or removed in the bar.
+  - Starting sets `currentTaskId` = first queued task, `ActiveSession.queue` = the rest, `Session.plannedTaskIds` = the full queue.
+
+### 2.2 Active timer (replaces the current layout)
+- The **current segment** is the fixed, spotlighted element: task name (or "Untitled") + its stopwatch, always in the same place. On a single-segment session that's all there is (lap = session).
+- After the first Completed task, a subtle secondary **session timer** (total running time) appears; the window marker, if set, belongs to it.
+- **Next up** (new): when `queue` is non-empty, a quiet "Next: <task>" line under the spotlight.
+- Completed laps are not listed on this screen.
+- **Completed task:** closes the segment as before. The new lap takes the head of `queue` if any, otherwise untitled. **Remove the "Choose next task" link/sheet.** No input, no prompt.
+- No skip or reorder mid-session. Pause, End and Quit unchanged.
+
+### 2.3 Session editor changes
+- **Header delta (new):** under "You spent 19:00", a subtle neutral delta vs. the window when one was set (e.g. "−1:00" / "+2:30"; sign only, no good/bad coloring). None for ∞.
+- **Zero-sum allocation (replaces over-allocation):** segments can never sum to more than the session total. Remove the over-allocation soft note. Interim enforcement: a segment's duration input is clamped to `total − Σ other segments`; the unallocated remainder row works as today. (The real allocation UX is an open question, below; keep this simple and replaceable.)
+- **`editedAt`:** set to now on every manual edit of a segment (duration, task, completed, excluded). Capture only; nothing reads it yet.
+
+### Acceptance criteria (chunk 2)
+- App opens on step 1 with ∞ selected; Next → Start Anything starts an untitled session (two taps).
+- Choosing 20 min shows "ending at" correctly; choosing an end time instead derives the window at Start.
+- Step 2 with W = 20: only fitting tasks show, biggest fill first; flexible tasks rank by `min(maxMin, W)`; no-estimate tasks are grouped at the bottom; archived never appear.
+- Queue three tasks: list re-filters against the remaining window; bar shows count and total; session starts on task 1 with "Next: task 2" visible; Completed advances through the queue, then falls back to untitled laps.
+- `plannedTaskIds` is saved on the session; queue survives force-quit.
+- Median alert re-arms for each queued task as it becomes current.
+- Editor shows the window delta; over-allocation is impossible; `editedAt` is written on edits.
+- Existing phone data (chunk 1) still loads and displays correctly.
+
+---
+
+## Open UI questions (not buildable yet)
+- **Allocation UX** in the editor: how the zero-sum constraint feels in use (remainder pool, splitting, input method). Replaces the chunk 2 interim clamp.
+- **Duration resolution per task** (decided in principle, needs a field + allocation UX first): storage stays to the second; each task sets a snap increment for display/editing (e.g. dishes to the minute, exercise to the second); needs a Task field, e.g. `snapSec?: number`. The live stopwatch always shows seconds; resolution applies to the editor, History and stats. Untitled segments default to 1 min. **Leftover seconds** (snapped segments vs. exact total) go to one absorber segment: the last unedited segment in order; if every segment has been edited, the one edited longest ago (via `editedAt`). The absorber stores exact seconds; display rounds to its task's increment.
+
+---
+
+## PLANNED / later chunks (DO NOT BUILD YET)
+- **Routines (saved queues):** named, reusable queues ("Sunday reset": dishes, laundry, vacuum) that pre-populate step 2's queue. New entity + screen. Should reuse the chunk 2 queue mechanics.
+- **Unfiled sessions surface:** a derived view/badge for sessions with untitled segments (no extra storage). Punted; untitled time stays in History until assigned.
+- **Session delta / goal targeting:** per-task or per-session goals (finish under, fill the window) that drive how the review delta is styled. V2 candidate.
+- **Picker:** given a window, filter with `fitsWindow`, rank by staleness (time since last completed segment relative to `targetFrequencyDays`; partial progress may count partially), weighted random. Possible extra signals: `preferredTimes` / learned time-of-day from segment `startedAt`, reroll/skip history from `PickerEvent`, plan-vs-actual from `plannedTaskIds`. "Choose for me" = one pick + reroll. "Show options" = max 3. Picking starts the session with that window and task, `startSource` set accordingly.
 - **Live concurrency** (segments with multiple tasks): deferred; migration would be `taskId → taskIds[]`.
 - Possibly push notifications via a small backend if foreground-only alerts prove insufficient.
