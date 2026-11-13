@@ -17,11 +17,17 @@ export const liveTasks = () => live(() => db.tasks.toArray().then((ts) => ts.sor
 
 export const liveSettings = () => live(getSettings);
 
-/** Derived on read from all raw data (small, personal-scale data set). */
-export const liveStats = () =>
+/**
+ * Derived on read from all raw data (small, personal-scale data set).
+ * `excludeSessionId` leaves one session out, e.g. so Review compares against the typical time before it.
+ */
+export const liveStats = (excludeSessionId?: string) =>
   live(async (): Promise<Map<string, TaskStats>> => {
-    const [tasks, sessions, segments] = await Promise.all([db.tasks.toArray(), db.sessions.toArray(), db.segments.toArray()]);
-    return computeAllStats(tasks, sessions, segments);
+    const [tasks, sessions] = await Promise.all([db.tasks.toArray(), db.sessions.toArray()]);
+    return computeAllStats(
+      tasks,
+      excludeSessionId ? sessions.filter((s) => s.id !== excludeSessionId) : sessions,
+    );
   });
 
 export const taskMap = (tasks: Task[] | undefined) => new Map((tasks ?? []).map((t) => [t.id, t]));

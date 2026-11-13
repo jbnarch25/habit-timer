@@ -1,85 +1,88 @@
 import { describe, expect, it } from 'vitest';
-import type { Segment, Session, Task } from '../src/lib/model';
-import { computeAllStats, durationLabel, expectedSec } from '../src/lib/stats/stats';
+import type { Session, Task } from '../src/lib/model';
+import { buildTaskList, DEFAULT_SORT } from '../src/lib/start/taskList';
+import { computeAllStats, fitsWindow, median, typicalSec } from '../src/lib/stats/stats';
 
-const task = (over: Partial<Task> = {}): Task => ({
-  id: 't1',
-  name: 'Dishes',
-  durationMode: 'fixed',
-  medianAlert: true,
+const task = (id: string, extra: Partial<Task> = {}): Task => ({
+  id,
+  name: id,
+  taskAlert: false,
   archived: false,
   createdAt: 0,
-  ...over,
-});
-const session = (id: string, startedAt: number, discarded = false): Session => ({
-  id,
-  startedAt,
-  endedAt: startedAt + 1,
-  startSource: 'quick',
-  pauses: [],
-  discarded,
+  ...extra,
 });
 let n = 0;
-const seg = (sessionId: string, durationSec: number, over: Partial<Segment> = {}): Segment => ({
-  id: `g${n++}`,
-  sessionId,
-  order: 0,
-  taskId: 't1',
+const sess = (taskId: string, startedAt: number, durationSec: number): Session => ({
+  id: `s${n++}`,
+  taskId,
+  startedAt,
+  endedAt: startedAt + durationSec * 1000,
   durationSec,
-  completed: true,
-  source: 'live',
-  excluded: false,
-  ...over,
+  pauses: [],
 });
 
-describe('median', () => {
-  it('ignores excluded, short, unfinished-fixed and discarded segments', () => {
-    const sessions = [session('a', 1), session('b', 2), session('c', 3, true)];
-    const segments = [
-      seg('a', 600),
-      seg('a', 700, { order: 1 }),
-      seg('a', 900, { order: 2 }),
-      seg('b', 5000, { excluded: true }),
-      seg('b', 20, { order: 1 }), // < 30s
-      seg('b', 4000, { order: 2, completed: false }), // unfinished fixed
-      seg('c', 9000), // discarded session
+describe('stats', () => {
+  it('median of the last 10 sessions of at least 30s', () => {
+    const t = task('a');
+    const sessions = [
+      sess('a', 1, 10), // too short
+      ...Array.from({ length: 12 }, (_, i) => sess('a', 100 + i, 60 * (i + 1))), // 1..12 min
     ];
-    const st = computeAllStats([task()], sessions, segments).get('t1')!;
-    expect(st.medianSec).toBe(700);
-    expect(st.sampleSize).toBe(3);
-  });
-
-  it('counts unfinished segments for flexible tasks', () => {
-    const t = task({ durationMode: 'flexible' });
-    const st = computeAllStats([t], [session('a', 1)], [seg('a', 100), seg('a', 300, { order: 1, completed: false })]).get('t1')!;
-    expect(st.medianSec).toBe(200);
-  });
-
-  it('uses only the last 10 qualifying segments', () => {
-    const sessions = Array.from({ length: 12 }, (_, i) => session(`s${i}`, i));
-    // First two are huge outliers; they fall out of the window of 10.
-    const segments = sessions.map((s, i) => seg(s.id, i < 2 ? 99_999 : 60 + i));
-    const st = computeAllStats([task()], sessions, segments).get('t1')!;
+    const st = computeAllStats([t], sessions).get('a')!;
+    // last 10 qualifying: 3..12 min → median 7.5 min
+    expect(st.medianSec).toBe(450);
     expect(st.sampleSize).toBe(10);
-    expect(st.medianSec).toBe((60 + 6 + 60 + 7) / 2);
+    expect(st.sessionCount).toBe(13);
+    expect(st.lastDoneAt).toBe(111);
   });
 
-  it('last done and counts skip discarded sessions', () => {
-    const sessions = [session('a', 100), session('b', 200), session('c', 300, true)];
-    const segments = [seg('a', 60), seg('b', 60, { completed: false }), seg('c', 60)];
-    const st = computeAllStats([task()], sessions, segments).get('t1')!;
-    expect(st.lastDoneAt).toBe(100);
-    expect(st.sessionCount).toBe(2);
-    expect(st.segmentCount).toBe(2);
+  it('median helper', () => {
+    expect(median([])).toBeNull();
+    expect(median([3, 1, 2])).toBe(2);
   });
 
-  it('falls back to estimate (fixed) or range (flexible)', () => {
-    const empty = computeAllStats([task({ estimateMin: 7 })], [], []).get('t1');
-    expect(expectedSec(task({ estimateMin: 7 }), empty)).toBe(420);
-    expect(durationLabel(task({ estimateMin: 7 }), empty)).toBe('est. 7 min');
-    const flex = task({ durationMode: 'flexible', minMin: 10, maxMin: null });
-    expect(expectedSec(flex, empty)).toBeNull();
-    expect(durationLabel(flex, empty)).toBe('10 min+ · open-ended');
-    expect(durationLabel(task({ durationMode: 'flexible', minMin: 5, maxMin: 30 }), empty)).toBe('5–30 min');
+  it('typical time: goal, else median', () => {
+    const st = { medianSec: 300, sampleSize: 3, lastDoneAt: 1, sessionCount: 3 };
+    expect(typicalSec(task('a', { goalMin: 10 }), st)).toBe(600);
+    expect(typicalSec(task('a'), st)).toBe(300);
+    expect(typicalSec(task('a'), undefined)).toBeNull();
+  });
+});
+
+describe('window filter: first property set decides', () => {
+  const med = (m: number) => ({ medianSec: m * 60, sampleSize: 1, lastDoneAt: 1, sessionCount: 1 });
+  it('min chunk wins over everything', () => {
+    expect(fitsWindow(task('a', { minChunkMin: 10, maxMin: 60, goalMin: 60 }), med(60), 15)).toBe(true);
+    expect(fitsWindow(task('a', { minChunkMin: 20 }), undefined, 15)).toBe(false);
+  });
+  it('then max, then goal, then median', () => {
+    expect(fitsWindow(task('a', { maxMin: 30, goalMin: 5 }), undefined, 15)).toBe(false);
+    expect(fitsWindow(task('a', { goalMin: 10 }), med(60), 15)).toBe(true);
+    expect(fitsWindow(task('a', { goalMin: 20 }), med(5), 15)).toBe(false);
+    expect(fitsWindow(task('a'), med(20), 15)).toBe(false);
+    expect(fitsWindow(task('a'), med(15), 15)).toBe(true);
+  });
+  it('nothing set: always shows; infinite window: no filtering', () => {
+    expect(fitsWindow(task('a'), undefined, 1)).toBe(true);
+    expect(fitsWindow(task('a', { maxMin: 600 }), undefined, null)).toBe(true);
+  });
+});
+
+describe('task list', () => {
+  it('drops archived and non-fitting; default sort is last done, oldest (never) first', () => {
+    const tasks = [task('recent'), task('old'), task('never'), task('gone', { archived: true }), task('big', { maxMin: 99 })];
+    const stats = computeAllStats(tasks, [sess('recent', 500, 60), sess('old', 100, 60)]);
+    expect(buildTaskList(tasks, stats, 30, DEFAULT_SORT).map((t) => t.id)).toEqual(['never', 'old', 'recent']);
+    expect(buildTaskList(tasks, stats, 30, { key: 'lastDone', asc: false }).map((t) => t.id)).toEqual([
+      'recent',
+      'old',
+      'never',
+    ]);
+    expect(buildTaskList(tasks, stats, null, { key: 'name', asc: true }).map((t) => t.id)).toEqual([
+      'big',
+      'never',
+      'old',
+      'recent',
+    ]);
   });
 });
