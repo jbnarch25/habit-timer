@@ -31,7 +31,7 @@
     if (!$settings) return;
     alerts.unlock();
     alerts.setPrefs({ beep: $settings.beep, voice: $settings.voice, voiceURI: $settings.voiceURI });
-    alerts.announce('Twenty minutes. Dishes usually takes twenty-five minutes.');
+    alerts.announce('window', 'Twenty minutes.');
   }
 
   async function doExport() {
@@ -73,7 +73,7 @@
         <input type="checkbox" class="switch" checked={$settings.beep} onchange={(e) => set({ beep: e.currentTarget.checked })} />
       </label>
       <label class="toggle-row">
-        <span>Voice</span>
+        <span>Voice<br /><span class="muted small">Spoken alerts. Off by default; wording not final.</span></span>
         <input type="checkbox" class="switch" checked={$settings.voice} onchange={(e) => set({ voice: e.currentTarget.checked })} />
       </label>
       {#if $settings.voice && voices.length}
@@ -87,24 +87,7 @@
         </div>
       {/if}
       <div class="toggle-row">
-        <button class="link" onclick={test}>Test alert</button>
-      </div>
-    </div>
-
-    <h2 class="section-title">Combine close alerts</h2>
-    <div class="card pad">
-      <p class="muted small">Alerts closer than the larger of these fire as one announcement.</p>
-      <div class="two">
-        <label class="field">
-          Minutes
-          <input type="number" inputmode="decimal" min="0" value={$settings.coalesceMinMin}
-            onchange={(e) => set({ coalesceMinMin: Math.max(0, Number(e.currentTarget.value) || 0) })} />
-        </label>
-        <label class="field">
-          % of window
-          <input type="number" inputmode="numeric" min="0" max="100" value={$settings.coalescePct}
-            onchange={(e) => set({ coalescePct: Math.max(0, Number(e.currentTarget.value) || 0) })} />
-        </label>
+        <button class="link" onclick={test}>Test window alert</button>
       </div>
     </div>
 
@@ -134,7 +117,7 @@
 
 {#if pendingImport}
   <ConfirmDialog
-    message="Replace ALL current data with {pendingImport.tasks.length} tasks, {pendingImport.sessions.length} sessions and {pendingImport.segments.length} segments from this file?"
+    message="Replace ALL current data with {pendingImport.tasks.length} tasks, {pendingImport.sessions.length} sessions from this file?"
     confirmLabel="Replace everything"
     danger
     onconfirm={confirmImport}
@@ -151,11 +134,6 @@
   }
   .pad p {
     margin: 0 0 10px;
-  }
-  .two {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
   }
   .data {
     display: flex;
