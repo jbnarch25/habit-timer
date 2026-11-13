@@ -4,10 +4,11 @@
   let {
     message,
     confirmLabel = 'Confirm',
+    cancelLabel = 'Cancel',
     danger = false,
     onconfirm,
     oncancel,
-  }: { message: string; confirmLabel?: string; danger?: boolean; onconfirm: () => void; oncancel: () => void } =
+  }: { message: string; confirmLabel?: string; cancelLabel?: string; danger?: boolean; onconfirm: () => void; oncancel: () => void } =
     $props();
 </script>
 
@@ -15,7 +16,7 @@
   <p class="msg">{message}</p>
   <div class="actions">
     <button class="btn block" class:danger onclick={onconfirm}>{confirmLabel}</button>
-    <button class="btn block" onclick={oncancel}>Cancel</button>
+    <button class="btn block" onclick={oncancel}>{cancelLabel}</button>
   </div>
 </Sheet>
 

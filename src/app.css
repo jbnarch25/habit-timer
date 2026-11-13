@@ -278,3 +278,31 @@ input[type='checkbox'].switch:checked {
 input[type='checkbox'].switch:checked::after {
   transform: translateX(20px);
 }
+
+/* Large cancel X (timer and lead-in): easy to hit. */
+.x-btn {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 24px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Per-row "…" menu button. */
+.more-btn {
+  min-width: 48px;
+  min-height: 48px;
+  color: var(--muted);
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}

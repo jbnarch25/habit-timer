@@ -2,16 +2,16 @@
   import { onDestroy, onMount, untrack } from 'svelte';
   import Banner from '../components/Banner.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
-  import { coalesceThresholdMs, computeRawPoints, planAlerts } from '../lib/alerts/points';
+  import { computePoints, planAlerts } from '../lib/alerts/points';
   import { alerts } from '../lib/alerts/webAlertService';
   import { formatMs } from '../lib/format';
   import { liveSettings, liveStats, liveTasks, taskMap } from '../lib/live';
-  import { queueOf, type ActiveSession } from '../lib/model';
+  import type { ActiveSession } from '../lib/model';
   import { keepAwake } from '../lib/platform/wakeLock';
-  import { navigate } from '../lib/router.svelte';
+  import { review } from '../lib/review.svelte';
   import * as svc from '../lib/services/sessionService';
-  import { expectedSec } from '../lib/stats/stats';
-  import { lapElapsedMs, sessionElapsedMs, sessionMsAt } from '../lib/time/elapsed';
+  import { typicalSec } from '../lib/stats/stats';
+  import { sessionElapsedMs } from '../lib/time/elapsed';
 
   let { active }: { active: ActiveSession } = $props();
 
@@ -21,21 +21,16 @@
 
   let now = $state(Date.now());
   let banners = $state<string[]>([]);
-  let confirmQuit = $state(false);
+  let confirmCancel = $state(false);
   let busy = false;
 
   const paused = $derived(active.pausedAt != null);
   const sessionMs = $derived(sessionElapsedMs(active, now));
-  const lapMs = $derived(lapElapsedMs(active, active.currentLapStartedAt, now));
-  const tasksById = $derived(taskMap($tasks));
-  const currentTask = $derived(active.currentTaskId ? tasksById.get(active.currentTaskId) : undefined);
+  const task = $derived(active.taskId ? taskMap($tasks).get(active.taskId) : undefined);
+  const maxMs = $derived(task?.maxMin ? task.maxMin * 60_000 : null);
   const windowMs = $derived(active.windowMin ? active.windowMin * 60_000 : 0);
-  // After the first "Completed task" the lap no longer equals the session.
-  const multiLap = $derived(active.currentLapStartedAt !== active.startedAt);
-  const nextTask = $derived.by(() => {
-    const id = queueOf(active)[0];
-    return id ? tasksById.get(id) : undefined;
-  });
+  // Countdown when the task has a maximum. Round up so it reads 0:00 only at the end.
+  const shownMs = $derived(maxMs != null ? Math.ceil(Math.max(0, maxMs - sessionMs) / 1000) * 1000 : sessionMs);
 
   // Re-render clock. Elapsed is always recomputed from stored timestamps.
   let tick: ReturnType<typeof setInterval>;
@@ -57,51 +52,39 @@
     if ($settings) keepAwake($settings.wakeLock);
   });
 
-  // Alert prefs
-  $effect(() => {
-    if ($settings) alerts.setPrefs({ beep: $settings.beep, voice: $settings.voice, voiceURI: $settings.voiceURI });
-  });
-
   // Ids already announced/bannered in this view, to avoid duplicates before the DB write round-trips.
   const handled = new Set<string>();
+  const awayText = (id: string, text: string) => `Passed while away: ${id === 'window' ? 'window, ' : ''}${text}`;
 
   alerts.onFired = (alert, played) => {
-    alert.ids.forEach((id) => handled.add(id));
-    if (!played) banners = [...banners, `Passed while away: ${alert.text}`];
-    void svc.markAlertsFired(alert.ids);
+    handled.add(alert.id);
+    if (!played) banners = [...banners, awayText(alert.id, alert.text)];
+    void svc.markAlertsFired([alert.id]);
   };
 
-  // (Re)plan alerts whenever the session, lap, task, history or settings change. Not on clock ticks.
+  // (Re)plan alerts whenever the session, task or history change. Not on clock ticks. None while paused.
   $effect(() => {
-    if (!$settings || !$stats || !$tasks) return;
+    if (!$stats || !$tasks) return;
     if (active.pausedAt != null) {
       alerts.cancel(); // rescheduled on resume
       return;
     }
-    const task = active.currentTaskId ? taskMap($tasks).get(active.currentTaskId) : undefined;
-    const raw = computeRawPoints({
+    const t = active.taskId ? taskMap($tasks).get(active.taskId) : undefined;
+    const points = computePoints({
       windowMin: active.windowMin,
-      lapStartSessionMs: sessionMsAt(active, active.currentLapStartedAt),
-      lapStartedAt: active.currentLapStartedAt,
-      taskName: task?.name,
-      expectedSec: task ? expectedSec(task, $stats.get(task.id)) : null,
-      medianAlert: task?.medianAlert ?? false,
+      taskName: t?.name,
+      typicalSec: t ? typicalSec(t, $stats.get(t.id)) : null,
+      taskAlert: t?.taskAlert ?? false,
     });
-    const t = Date.now();
-    const nowSessionMs = sessionElapsedMs(active, t);
-    const plan = planAlerts(
-      raw,
-      [...active.alertsFired, ...handled],
-      nowSessionMs,
-      coalesceThresholdMs(active.windowMin, $settings.coalesceMinMin, $settings.coalescePct),
-    );
-    const stale = plan.stale.filter((p) => !p.ids.some((id) => handled.has(id)));
-    if (stale.length) {
-      stale.forEach((p) => p.ids.forEach((id) => handled.add(id)));
-      untrack(() => (banners = [...banners, ...stale.map((p) => `Passed while away: ${p.text}`)]));
-      void svc.markAlertsFired(stale.flatMap((p) => p.ids));
+    const wall = Date.now();
+    const nowSessionMs = sessionElapsedMs(active, wall);
+    const plan = planAlerts(points, [...active.alertsFired, ...handled], nowSessionMs);
+    if (plan.stale.length) {
+      plan.stale.forEach((p) => handled.add(p.id));
+      untrack(() => (banners = [...banners, ...plan.stale.map((p) => awayText(p.id, p.text))]));
+      void svc.markAlertsFired(plan.stale.map((p) => p.id));
     }
-    alerts.schedule(plan.upcoming.map((p) => ({ ids: p.ids, text: p.text, at: t + (p.atSessionMs - nowSessionMs) })));
+    alerts.schedule(plan.upcoming.map((p) => ({ id: p.id, text: p.text, at: wall + (p.atSessionMs - nowSessionMs) })));
   });
 
   async function act(fn: () => Promise<unknown>) {
@@ -115,77 +98,70 @@
     }
   }
 
-  const completeLap = () => act(() => svc.completeLap());
   const togglePause = () => act(() => (paused ? svc.resume() : svc.pause()));
-  const endSession = () =>
+  const endTask = () =>
     act(async () => {
-      const s = await svc.end();
-      navigate(`/session/${s.id}?fresh`);
+      review.ending = true;
+      try {
+        review.current = await svc.end(Date.now(), task?.maxMin != null ? task.maxMin * 60 : undefined);
+      } finally {
+        review.ending = false;
+      }
     });
-  const quit = () =>
+  const cancel = () =>
     act(async () => {
-      confirmQuit = false;
-      await svc.quit();
-      navigate('/');
+      confirmCancel = false;
+      await svc.cancel();
     });
-</script>
 
-{#snippet windowMarker()}
-  <div class="window">
-    <div class="bar"><div class="fill" class:over={sessionMs > windowMs} style:width="{Math.min(100, (sessionMs / windowMs) * 100)}%"></div></div>
-    <span class="muted small tabular">
-      {sessionMs > windowMs ? `+${formatMs(sessionMs - windowMs)} over` : `${formatMs(windowMs - sessionMs)} left`}
-      of {active.windowMin} min
-    </span>
-  </div>
-{/snippet}
+  // Countdown reached zero: end automatically and go to Review.
+  $effect(() => {
+    if (maxMs != null && !paused && sessionMs >= maxMs) untrack(endTask);
+  });
+</script>
 
 <!-- Any tap re-unlocks audio (needed after a reload restores a running session without a gesture). -->
 <div class="timer page" class:paused onpointerdown={() => alerts.unlock()} role="presentation">
   <header class="topbar">
     <span></span>
-    <button class="icon-btn quit" onclick={() => (confirmQuit = true)} aria-label="Quit session">✕</button>
+    <button class="x-btn" onclick={() => (confirmCancel = true)} aria-label="Cancel session">✕</button>
   </header>
 
   <Banner messages={banners} ondismiss={(i) => (banners = banners.filter((_, j) => j !== i))} />
 
   <section class="clock">
-    <!-- Spotlight: current segment. Fixed position; nothing above it changes size. -->
     <div class="paused-label" class:on={paused}>Paused</div>
-    <div class="spotlight">
-      <div class="task-name" class:untitled={!currentTask}>{currentTask?.name ?? 'Untitled'}</div>
-      <div class="lap-time tabular">{formatMs(lapMs)}</div>
-    </div>
+    <div class="task-name" class:anything={!active.taskId}>{task?.name ?? 'Anything'}</div>
+    <div class="time tabular">{formatMs(shownMs)}</div>
+    {#if maxMs != null}<div class="muted small">counting down from {task?.maxMin} min</div>{/if}
 
-    {#if nextTask}<div class="next muted">Next: {nextTask.name}</div>{/if}
-
-    {#if multiLap}
-      <div class="session">
-        <span class="muted tabular">Session {formatMs(sessionMs)}</span>
-        {#if windowMs}{@render windowMarker()}{/if}
+    {#if windowMs}
+      <div class="window">
+        <div class="bar">
+          <div class="fill" class:over={sessionMs > windowMs} style:width="{Math.min(100, (sessionMs / windowMs) * 100)}%"></div>
+        </div>
+        <span class="muted small tabular">
+          {sessionMs > windowMs ? `+${formatMs(sessionMs - windowMs)} over` : `${formatMs(windowMs - sessionMs)} left`}
+          of {active.windowMin} min
+        </span>
       </div>
-    {:else if windowMs}
-      <!-- lap = session: the window marker sits with the spotlight -->
-      {@render windowMarker()}
     {/if}
   </section>
 
   <section class="controls">
-    <button class="btn primary big" onclick={completeLap} disabled={paused}>Completed task</button>
-    <div class="secondary">
-      <button class="btn" class:resume={paused} onclick={togglePause}>{paused ? 'Resume' : 'Pause'}</button>
-      <button class="btn" onclick={endSession}>End session</button>
-    </div>
+    <button class="btn primary big" onclick={endTask}>End Task</button>
+    <button class="btn big" class:resume={paused} onclick={togglePause}>{paused ? 'Resume' : 'Pause'}</button>
   </section>
 </div>
 
-{#if confirmQuit}
+{#if confirmCancel}
   <ConfirmDialog
-    message="Discard this session? {formatMs(sessionMs)} won't count."
-    confirmLabel="Discard"
+    message="Cancel this session? {formatMs(sessionMs)} won't be saved."
+    confirmLabel="Cancel session"
+    cancelLabel="Keep going"
     danger
-    onconfirm={quit}
-    oncancel={() => (confirmQuit = false)}
+    onconfirm={cancel}
+    oncancel={() => (confirmCancel = false)}
   />
 {/if}
 
@@ -195,33 +171,24 @@
     display: flex;
     flex-direction: column;
   }
-  .quit {
-    font-size: 18px;
-  }
   .clock {
     flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: flex-start;
-    padding-top: 10dvh;
+    padding-top: 8dvh;
     gap: 12px;
     text-align: center;
   }
-  .spotlight {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 6px;
-  }
-  .lap-time {
+  .time {
     font-size: clamp(64px, 22vw, 104px);
     font-weight: 200;
     letter-spacing: -0.02em;
     line-height: 1;
   }
-  .paused .lap-time,
-  .paused .session {
+  .paused .time,
+  .paused .window {
     opacity: 0.45;
   }
   .paused-label {
@@ -229,25 +196,22 @@
     font-weight: 700;
     letter-spacing: 0.15em;
     text-transform: uppercase;
-    visibility: hidden; /* reserves its space so the spotlight never moves */
+    visibility: hidden; /* reserves its space so the clock never moves */
   }
   .paused-label.on {
     visibility: visible;
     animation: pulse 1.4s ease-in-out infinite;
   }
-  .next {
-    font-size: 17px;
+  .task-name {
+    font-size: 28px;
+    font-weight: 600;
   }
-  .session {
-    margin-top: 20px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-    font-size: 18px;
-    width: 100%;
+  .task-name.anything {
+    color: var(--muted);
+    font-weight: 500;
   }
   .window {
+    margin-top: 16px;
     width: min(280px, 80%);
     display: flex;
     flex-direction: column;
@@ -268,14 +232,6 @@
   .fill.over {
     background: var(--danger);
   }
-  .task-name {
-    font-size: 28px;
-    font-weight: 600;
-  }
-  .task-name.untitled {
-    color: var(--muted);
-    font-weight: 500;
-  }
   .controls {
     display: flex;
     flex-direction: column;
@@ -286,11 +242,6 @@
     min-height: 72px;
     font-size: 20px;
     border-radius: 18px;
-  }
-  .secondary {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
   }
   .resume {
     background: var(--paused);

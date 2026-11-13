@@ -29,3 +29,9 @@ export function relativeDay(ms: number, now = Date.now()): string {
   if (diff < 7) return `${diff} days ago`;
   return formatDate(ms);
 }
+
+/** Signed difference as a duration: 192 -> "+3:12", -240 -> "−4:00". */
+export function formatDelta(sec: number): string {
+  const r = Math.round(sec);
+  return `${r < 0 ? '−' : '+'}${formatDuration(Math.abs(r))}`;
+}
