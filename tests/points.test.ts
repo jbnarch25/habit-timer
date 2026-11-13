@@ -1,44 +1,39 @@
 import { describe, expect, it } from 'vitest';
-import { coalesceThresholdMs, computeRawPoints, medianPointId, planAlerts, WINDOW_POINT_ID } from '../src/lib/alerts/points';
+import { computePoints, planAlerts } from '../src/lib/alerts/points';
 
 const min = (m: number) => m * 60_000;
 
 describe('alert points', () => {
-  const base = { lapStartedAt: 123, lapStartSessionMs: 0, taskName: 'Dishes', medianAlert: true };
-
-  it('coalesces window and median within threshold, firing at the earlier time', () => {
-    const raw = computeRawPoints({ ...base, windowMin: 20, expectedSec: 22 * 60 });
-    const thr = coalesceThresholdMs(20, 2, 15); // max(2 min, 3 min) = 3 min
-    expect(thr).toBe(min(3));
-    const plan = planAlerts(raw, [], 0, thr);
-    expect(plan.upcoming).toHaveLength(1);
-    expect(plan.upcoming[0].atSessionMs).toBe(min(20));
-    expect(plan.upcoming[0].ids).toEqual([WINDOW_POINT_ID, medianPointId(123)]);
-    expect(plan.upcoming[0].text).toBe('20 minutes. Dishes usually takes 22 minutes.');
+  it('window alert only when a window is set', () => {
+    expect(computePoints({ typicalSec: null, taskAlert: false })).toEqual([]);
+    expect(computePoints({ windowMin: 20, typicalSec: null, taskAlert: false }).map((p) => [p.id, p.atSessionMs])).toEqual([
+      ['window', min(20)],
+    ]);
   });
 
-  it('keeps points apart when beyond threshold', () => {
-    const raw = computeRawPoints({ ...base, windowMin: 20, expectedSec: 10 * 60 });
-    expect(planAlerts(raw, [], 0, coalesceThresholdMs(20, 2, 15)).upcoming).toHaveLength(2);
+  it('task alert needs the toggle, a typical time and a task', () => {
+    expect(computePoints({ typicalSec: 600, taskAlert: false, taskName: 'Dishes' })).toEqual([]);
+    expect(computePoints({ typicalSec: null, taskAlert: true, taskName: 'Dishes' })).toEqual([]);
+    expect(computePoints({ typicalSec: 600, taskAlert: true })).toEqual([]);
+    const [p] = computePoints({ typicalSec: 600, taskAlert: true, taskName: 'Dishes' });
+    expect(p.id).toBe('task');
+    expect(p.atSessionMs).toBe(min(10));
   });
 
-  it('median is measured from the lap start and skipped when disabled or unknown', () => {
-    const raw = computeRawPoints({ ...base, lapStartSessionMs: min(5), expectedSec: 300 });
-    expect(raw[0].atSessionMs).toBe(min(10));
-    expect(computeRawPoints({ ...base, medianAlert: false, expectedSec: 300 })).toHaveLength(0);
-    expect(computeRawPoints({ ...base, expectedSec: null })).toHaveLength(0);
+  it('skips the task alert within 1 minute of the window alert; window wins', () => {
+    const at = (typicalSec: number) =>
+      computePoints({ windowMin: 20, typicalSec, taskAlert: true, taskName: 'Dishes' }).map((p) => p.id);
+    expect(at(20 * 60 + 60)).toEqual(['window']);
+    expect(at(20 * 60 - 60)).toEqual(['window']);
+    expect(at(20 * 60 + 61)).toEqual(['window', 'task']);
+    expect(at(10 * 60)).toEqual(['task', 'window']);
   });
 
-  it('does not let an already-fired point swallow a new one', () => {
-    const raw = computeRawPoints({ ...base, windowMin: 20, lapStartSessionMs: min(19), expectedSec: 60 });
-    const plan = planAlerts(raw, [WINDOW_POINT_ID], min(19.5), coalesceThresholdMs(20, 2, 15));
-    expect(plan.upcoming.map((p) => p.ids)).toEqual([[medianPointId(123)]]);
-  });
-
-  it('points passed while away are stale, not scheduled', () => {
-    const raw = computeRawPoints({ ...base, windowMin: 10, expectedSec: 30 * 60 });
-    const plan = planAlerts(raw, [], min(12), min(2));
-    expect(plan.stale.map((p) => p.ids)).toEqual([[WINDOW_POINT_ID]]);
-    expect(plan.upcoming.map((p) => p.ids)).toEqual([[medianPointId(123)]]);
+  it('plans stale vs upcoming and skips fired', () => {
+    const pts = computePoints({ windowMin: 20, typicalSec: 600, taskAlert: true, taskName: 'Dishes' });
+    const plan = planAlerts(pts, [], min(15));
+    expect(plan.stale.map((p) => p.id)).toEqual(['task']);
+    expect(plan.upcoming.map((p) => p.id)).toEqual(['window']);
+    expect(planAlerts(pts, ['task'], min(15)).stale).toEqual([]);
   });
 });

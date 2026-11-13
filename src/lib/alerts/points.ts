@@ -1,82 +1,66 @@
 // Pure alert-point computation. Times are session "active ms" (paused time excluded).
 
+export type AlertKind = 'window' | 'task';
+
 export interface AlertPoint {
-  /** Raw point ids merged into this one. Recorded in ActiveSession.alertsFired once handled. */
-  ids: string[];
+  id: AlertKind;
   /** Session active ms at which the point fires. */
   atSessionMs: number;
+  /** Spoken text (voice is off by default) and banner text if it passed while away. */
   text: string;
 }
 
 export interface AlertInputs {
   windowMin?: number;
-  /** Session active ms at which the current lap started. */
-  lapStartSessionMs: number;
-  lapStartedAt: number;
   taskName?: string;
-  /** Expected duration for the current task (median or estimate), seconds. Null = no median alert. */
-  expectedSec: number | null;
-  medianAlert: boolean;
+  /** Typical time (goal, else median) in seconds; null = none. */
+  typicalSec: number | null;
+  /** task.taskAlert */
+  taskAlert: boolean;
 }
-
-export const WINDOW_POINT_ID = 'window';
-export const medianPointId = (lapStartedAt: number) => `median:${lapStartedAt}`;
 
 /** A point this close in the past is still played rather than shown as a stale banner. */
 export const LATE_GRACE_MS = 3000;
+
+/** The task alert is skipped when it falls within this distance of the window alert. */
+export const COLLISION_MS = 60_000;
 
 export const minutesText = (min: number) => {
   const m = Math.round(min);
   return `${m} minute${m === 1 ? '' : 's'}`;
 };
 
-export function coalesceThresholdMs(windowMin: number | undefined, minMin: number, pct: number): number {
-  const base = minMin * 60_000;
-  return windowMin ? Math.max(base, (windowMin * 60_000 * pct) / 100) : base;
-}
-
-/** Raw (uncoalesced) points for the current session/lap. */
-export function computeRawPoints(input: AlertInputs): AlertPoint[] {
-  const raw: AlertPoint[] = [];
-  if (input.windowMin) {
-    raw.push({ ids: [WINDOW_POINT_ID], atSessionMs: input.windowMin * 60_000, text: `${minutesText(input.windowMin)}.` });
+/** Window alert at windowMin; one task alert at the typical time, unless it collides with the window alert. */
+export function computePoints(input: AlertInputs): AlertPoint[] {
+  const points: AlertPoint[] = [];
+  const windowMs = input.windowMin ? input.windowMin * 60_000 : null;
+  if (windowMs != null) {
+    points.push({ id: 'window', atSessionMs: windowMs, text: `${minutesText(input.windowMin!)}.` });
   }
-  if (input.medianAlert && input.expectedSec != null && input.taskName) {
-    raw.push({
-      ids: [medianPointId(input.lapStartedAt)],
-      atSessionMs: input.lapStartSessionMs + input.expectedSec * 1000,
-      text: `${input.taskName} usually takes ${minutesText(Math.max(1, input.expectedSec / 60))}.`,
-    });
-  }
-  return raw;
-}
-
-/** Merge points within `thresholdMs` of each other into one that fires at the earliest time. */
-export function coalesce(points: AlertPoint[], thresholdMs: number): AlertPoint[] {
-  const sorted = [...points].sort((a, b) => a.atSessionMs - b.atSessionMs);
-  const out: AlertPoint[] = [];
-  for (const p of sorted) {
-    const last = out[out.length - 1];
-    if (last && p.atSessionMs - last.atSessionMs <= thresholdMs) {
-      last.ids.push(...p.ids);
-      last.text = `${last.text} ${p.text}`;
-    } else {
-      out.push({ ...p, ids: [...p.ids] });
+  if (input.taskAlert && input.typicalSec != null && input.taskName) {
+    const at = input.typicalSec * 1000;
+    if (windowMs == null || Math.abs(at - windowMs) > COLLISION_MS) {
+      points.push({
+        id: 'task',
+        atSessionMs: at,
+        text: `${input.taskName} usually takes ${minutesText(Math.max(1, input.typicalSec / 60))}.`,
+      });
     }
   }
-  return out;
+  return points.sort((a, b) => a.atSessionMs - b.atSessionMs);
 }
 
 export interface AlertPlan {
   /** Passed without being announced (app was backgrounded/killed): show a banner, don't play. */
   stale: AlertPoint[];
-  /** Still ahead (or just now): schedule, coalesced. */
+  /** Still ahead (or just now): schedule. */
   upcoming: AlertPoint[];
 }
 
-export function planAlerts(raw: AlertPoint[], fired: string[], nowSessionMs: number, thresholdMs: number): AlertPlan {
-  const unfired = raw.filter((p) => !p.ids.some((id) => fired.includes(id)));
-  const stale = unfired.filter((p) => p.atSessionMs < nowSessionMs - LATE_GRACE_MS);
-  const future = unfired.filter((p) => p.atSessionMs >= nowSessionMs - LATE_GRACE_MS);
-  return { stale, upcoming: coalesce(future, thresholdMs) };
+export function planAlerts(points: AlertPoint[], fired: string[], nowSessionMs: number): AlertPlan {
+  const unfired = points.filter((p) => !fired.includes(p.id));
+  return {
+    stale: unfired.filter((p) => p.atSessionMs < nowSessionMs - LATE_GRACE_MS),
+    upcoming: unfired.filter((p) => p.atSessionMs >= nowSessionMs - LATE_GRACE_MS),
+  };
 }
