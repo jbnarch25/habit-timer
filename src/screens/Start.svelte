@@ -1,16 +1,17 @@
 <script lang="ts">
-  // Start sequence (chunk 2). Step 1: window. Step 2: task / queue.
+  // Start sequence. Step 1: window. Step 2: task selection, then the 3‑2‑1 lead-in.
   // Visuals are placeholders: native <select>s render as iOS scroll wheels.
   import { onDestroy, onMount } from 'svelte';
+  import LeadIn from '../components/LeadIn.svelte';
+  import TaskNameCombobox from '../components/TaskNameCombobox.svelte';
   import { alerts } from '../lib/alerts/webAlertService';
-  import { formatTime } from '../lib/format';
-  import { liveStats, liveTasks, taskMap } from '../lib/live';
-  import type { DurationMode, StartSource } from '../lib/model';
+  import { formatTime, relativeDay } from '../lib/format';
+  import { liveStats, liveTasks } from '../lib/live';
   import { navigate } from '../lib/router.svelte';
   import { deriveWindowMin, start } from '../lib/services/sessionService';
-  import { createTask } from '../lib/services/taskService';
-  import { buildTaskList, queueTotals, remainingWindow } from '../lib/start/taskList';
-  import { durationLabel } from '../lib/stats/stats';
+  import { resolveTaskName } from '../lib/services/taskService';
+  import { buildTaskList, DEFAULT_SORT, type Sort, type SortKey } from '../lib/start/taskList';
+  import { cleanName, findByName } from '../lib/tasks/nameMatch';
 
   const tasks = liveTasks();
   const stats = liveStats();
@@ -28,11 +29,12 @@
   let mode = $state<'duration' | 'end'>('duration');
   let durationMin = $state<number | null>(null); // null = ∞
   let endAt = $state<number | null>(null);
-  let queue = $state<string[]>([]);
-  let barOpen = $state(false);
+
+  let sort = $state<Sort>({ ...DEFAULT_SORT });
+  let selectedId = $state<string | null>(null); // null = Start Anything
+  let newOpen = $state(false);
   let newName = $state('');
-  let newMode = $state<DurationMode>('fixed');
-  let starting = false;
+  let leadIn = $state<{ name: string; taskId: Promise<string | null> } | null>(null);
 
   // End-time slots: 5-min boundaries from ≥ now+5 min up to now+3 h (placeholder range).
   const endSlots = $derived.by(() => {
@@ -44,11 +46,14 @@
   const W = $derived(mode === 'duration' ? durationMin : endAt != null ? (deriveWindowMin(endAt, now) ?? null) : null);
 
   const statsMap = $derived($stats ?? new Map());
-  const byId = $derived(taskMap($tasks));
-  const queuedTasks = $derived(queue.map((id) => byId.get(id)).filter((t) => t != null));
-  const remaining = $derived(W == null ? null : remainingWindow(W, queuedTasks, statsMap));
-  const list = $derived(buildTaskList($tasks ?? [], statsMap, remaining, queue));
-  const totals = $derived(W == null ? null : queueTotals(queuedTasks, statsMap, W));
+  const rows = $derived(buildTaskList($tasks ?? [], statsMap, W, sort));
+  // A selection that the window filter hides falls back to Start Anything.
+  const selected = $derived(rows.find((t) => t.id === selectedId) ?? null);
+  const newDisplayName = $derived(findByName($tasks ?? [], newName)?.name ?? cleanName(newName));
+
+  const startLabel = $derived(
+    newOpen ? (newDisplayName ? `Start ${newDisplayName}` : 'Start What?') : selected ? `Start ${selected.name}` : 'Start Anything',
+  );
 
   function onDuration(e: Event) {
     const v = (e.currentTarget as HTMLSelectElement).value;
@@ -63,62 +68,63 @@
     endAt = Number(v);
   }
 
-  async function go(taskIds: string[], startSource: StartSource) {
-    if (starting) return;
-    starting = true;
-    alerts.unlock(); // inside the tap, for iOS audio + speech
-    try {
-      await start(
-        mode === 'end' && endAt != null
-          ? { taskIds, targetEndAt: endAt, startSource }
-          : { taskIds, windowMin: durationMin ?? undefined, startSource },
-      );
-    } finally {
-      starting = false;
+  function sortBy(key: SortKey) {
+    sort = sort.key === key ? { key, asc: !sort.asc } : { key, asc: key === 'name' ? true : DEFAULT_SORT.asc };
+  }
+  const arrow = (key: SortKey) => (sort.key === key ? (sort.asc ? ' ▲' : ' ▼') : '');
+
+  function tapStart() {
+    if (leadIn || (newOpen && !newDisplayName)) return;
+    alerts.unlock(); // inside the tap: iOS audio session + Web Audio
+    if (newOpen) {
+      // Quick-create: the task is made now and kept even if the session is canceled.
+      leadIn = { name: newDisplayName, taskId: resolveTaskName(newName).then((t) => t.id) };
+    } else {
+      leadIn = { name: selected?.name ?? 'Anything', taskId: Promise.resolve(selected?.id ?? null) };
     }
   }
 
-  const startAnything = () => (queue.length ? go(queue, 'picked') : go([], 'quick'));
-  const add = (id: string) => {
-    if (!queue.includes(id)) queue = [...queue, id];
-  };
-  // With a queue, tapping a row only queues it (owner decision); otherwise it starts that task.
-  const tapRow = (id: string) => (queue.length ? add(id) : go([id], 'picked'));
-
-  function move(i: number, d: -1 | 1) {
-    const j = i + d;
-    if (j < 0 || j >= queue.length) return;
-    const q = [...queue];
-    [q[i], q[j]] = [q[j], q[i]];
-    queue = q;
+  async function afterLeadIn() {
+    if (!leadIn) return;
+    try {
+      const taskId = await leadIn.taskId;
+      await start(
+        mode === 'end' && endAt != null ? { taskId, targetEndAt: endAt } : { taskId, windowMin: durationMin ?? undefined },
+      );
+    } catch (e) {
+      console.error(e);
+      leadIn = null;
+    }
   }
-  const remove = (i: number) => {
-    queue = queue.filter((_, j) => j !== i);
-    if (!queue.length) barOpen = false;
-  };
 
-  async function createNew(then: 'start' | 'queue') {
-    const name = newName.trim();
-    if (!name) return;
-    const t = await createTask({ name, durationMode: newMode });
-    newName = '';
-    if (then === 'start') await go([t.id], 'picked');
-    else add(t.id);
+  function cancelLeadIn() {
+    if (newOpen) {
+      // The task now exists: select it instead of leaving the quick-create open.
+      void leadIn?.taskId.then((id) => (selectedId = id));
+      newOpen = false;
+      newName = '';
+    }
+    leadIn = null;
   }
 
   const wLabel = (w: number | null) => (w == null ? '∞' : `${Math.max(0, Math.round(w))} min`);
+  const lastDone = (id: string) => {
+    const st = statsMap.get(id);
+    return st?.lastDoneAt ? `${relativeDay(st.lastDoneAt)} · ${st.sessionCount}×` : '—';
+  };
 </script>
 
 {#if step === 1}
   <div class="page step1">
     <header class="topbar">
       <span></span>
-      <nav class="row">
-        <button class="icon-btn" onclick={() => navigate('/tasks')}>Tasks</button>
-        <button class="icon-btn" onclick={() => navigate('/history')}>History</button>
-        <button class="icon-btn" onclick={() => navigate('/settings')} aria-label="Settings">⚙︎</button>
-      </nav>
+      <button class="gear" onclick={() => navigate('/settings')} aria-label="Settings">⚙︎</button>
     </header>
+
+    <nav class="tiles">
+      <button class="tile" onclick={() => navigate('/tasks')}>Tasks</button>
+      <button class="tile" onclick={() => navigate('/history')}>History</button>
+    </nav>
 
     <div class="sentence">
       <span>Start a</span>
@@ -137,89 +143,50 @@
     <button class="btn primary next" onclick={() => (step = 2)}>Next</button>
   </div>
 {:else}
-  <div class="page step2" class:with-bar={queue.length > 0}>
+  <div class="page step2">
     <header class="topbar">
       <button class="icon-btn" onclick={() => (step = 1)}>‹ Back</button>
-      <span class="muted small">
-        {#if W == null}∞ session{:else if queue.length}{wLabel(remaining)} left of {wLabel(W)}{:else}{wLabel(W)} window{/if}
-      </span>
+      <span class="muted small">{W == null ? '∞ session' : `${wLabel(W)} window`}</span>
     </header>
 
-    <ul class="card list">
-      <li>
-        <button class="row-main anything" onclick={startAnything}>
-          <span class="name">Start Anything</span>
-          <span class="muted small">{queue.length ? `Starts the ${queue.length}-task queue` : 'Untitled, name it later'}</span>
+    <div class="card table">
+      <div class="thead">
+        <button class="th grow" onclick={() => sortBy('name')}>Task{arrow('name')}</button>
+        <button class="th right" onclick={() => sortBy('lastDone')}>Last done{arrow('lastDone')}</button>
+      </div>
+      <button class="tr anything" class:on={!newOpen && !selected} onclick={() => ((selectedId = null), (newOpen = false))}>
+        <span class="grow name">Start Anything</span>
+        <span class="muted small">no task</span>
+      </button>
+      {#each rows as t (t.id)}
+        <button class="tr" class:on={!newOpen && selected?.id === t.id} onclick={() => ((selectedId = t.id), (newOpen = false))}>
+          <span class="grow name">{t.name}</span>
+          <span class="muted small right">{lastDone(t.id)}</span>
         </button>
-      </li>
-      {#each list.fits as t (t.id)}
-        <li>
-          <button class="row-main" onclick={() => tapRow(t.id)}>
-            <span class="name">{t.name}</span>
-            <span class="muted small">{durationLabel(t, statsMap.get(t.id))}</span>
-          </button>
-          <button class="icon-btn plus" onclick={() => add(t.id)} aria-label="Queue {t.name}">＋</button>
-        </li>
       {/each}
-    </ul>
+    </div>
 
-    {#if W != null && list.fits.length === 0}
-      <p class="muted small empty">{queue.length ? 'Nothing else fits the time left.' : 'No tasks fit this window.'}</p>
+    {#if W != null && rows.length === 0 && ($tasks?.length ?? 0) > 0}
+      <p class="muted small empty">No tasks fit this window.</p>
     {/if}
 
-    {#if list.noEstimate.length}
-      <h2 class="section-title">No estimate</h2>
-      <ul class="card list">
-        {#each list.noEstimate as t (t.id)}
-          <li>
-            <button class="row-main" onclick={() => tapRow(t.id)}><span class="name">{t.name}</span></button>
-            <button class="icon-btn plus" onclick={() => add(t.id)} aria-label="Queue {t.name}">＋</button>
-          </li>
-        {/each}
-      </ul>
-    {/if}
-
-    <h2 class="section-title">+ New task</h2>
-    <div class="card new">
-      <input type="text" placeholder="Task name" bind:value={newName} autocomplete="off" enterkeyhint="done" />
-      <div class="segmented">
-        <button class:on={newMode === 'fixed'} onclick={() => (newMode = 'fixed')}>Fixed</button>
-        <button class:on={newMode === 'flexible'} onclick={() => (newMode = 'flexible')}>Flexible</button>
-      </div>
-      <div class="row">
-        {#if !queue.length}
-          <button class="btn primary grow" disabled={!newName.trim()} onclick={() => createNew('start')}>Start</button>
-        {/if}
-        <button class="btn grow" disabled={!newName.trim()} onclick={() => createNew('queue')}>Add to queue</button>
-      </div>
+    <div class="card new" class:open={newOpen}>
+      <button class="new-toggle" onclick={() => (newOpen = !newOpen)}>{newOpen ? '− New Task' : '+ New Task'}</button>
+      {#if newOpen}
+        <div class="new-body">
+          <TaskNameCombobox tasks={$tasks ?? []} bind:value={newName} autofocus />
+        </div>
+      {/if}
     </div>
   </div>
 
-  {#if queue.length}
-    <div class="bar">
-      {#if barOpen}
-        <ol class="queue">
-          {#each queuedTasks as t, i (t.id)}
-            <li class="row">
-              <span class="grow">{i + 1}. {t.name}</span>
-              <button class="icon-btn" onclick={() => move(i, -1)} disabled={i === 0} aria-label="Move up">↑</button>
-              <button class="icon-btn" onclick={() => move(i, 1)} disabled={i === queue.length - 1} aria-label="Move down">↓</button>
-              <button class="icon-btn" onclick={() => remove(i)} aria-label="Remove">✕</button>
-            </li>
-          {/each}
-        </ol>
-      {/if}
-      {#if totals?.unknown}
-        <p class="muted small unknown">+{totals.unknown} task{totals.unknown > 1 ? 's' : ''} without an estimate</p>
-      {/if}
-      <div class="row">
-        <button class="btn" onclick={() => (barOpen = !barOpen)}>{barOpen ? 'Done' : 'Edit'}</button>
-        <button class="btn primary grow" onclick={() => go(queue, 'picked')}>
-          Start {queue.length} task{queue.length > 1 ? 's' : ''}{#if totals && W != null}&nbsp;· {Math.round(totals.min)} of {W} min{/if}
-        </button>
-      </div>
-    </div>
-  {/if}
+  <div class="bar">
+    <button class="btn primary go" disabled={newOpen && !newDisplayName} onclick={tapStart}>{startLabel}</button>
+  </div>
+{/if}
+
+{#if leadIn}
+  <LeadIn taskName={leadIn.name} ondone={afterLeadIn} oncancel={cancelLeadIn} />
 {/if}
 
 <style>
@@ -227,6 +194,34 @@
     min-height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
     display: flex;
     flex-direction: column;
+  }
+  .gear {
+    width: 52px;
+    height: 52px;
+    border-radius: 14px;
+    font-size: 28px;
+    color: var(--muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .tiles {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 4px;
+  }
+  .tile {
+    min-height: 72px;
+    border-radius: 18px;
+    background: var(--surface);
+    border: 2px solid var(--accent);
+    color: var(--accent);
+    font-size: 20px;
+    font-weight: 700;
+  }
+  .tile:active {
+    background: var(--surface-2);
   }
   .sentence {
     flex: 1;
@@ -259,35 +254,46 @@
     border-radius: 18px;
     margin-bottom: 8px;
   }
-  .step2.with-bar {
-    padding-bottom: 140px;
+  .step2 {
+    padding-bottom: calc(110px + env(safe-area-inset-bottom));
   }
-  .list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
+  .table {
     overflow: hidden;
   }
-  .list li {
+  .thead {
+    display: flex;
+    gap: 8px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .th {
+    min-height: 40px;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    text-align: left;
+  }
+  .right {
+    text-align: right;
+  }
+  .tr {
+    width: 100%;
+    min-height: 54px;
+    padding: 8px 16px;
     display: flex;
     align-items: center;
+    gap: 8px;
+    text-align: left;
+    border-left: 4px solid transparent;
   }
-  .list li + li {
+  .tr + .tr {
     border-top: 1px solid var(--border);
   }
-  .row-main {
-    flex: 1;
-    min-width: 0;
-    min-height: 58px;
-    padding: 8px 4px 8px 16px;
-    text-align: left;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 2px;
-  }
-  .row-main:active {
+  .tr.on {
     background: var(--surface-2);
+    border-left-color: var(--accent);
   }
   .name {
     font-size: 17px;
@@ -297,19 +303,22 @@
     color: var(--accent);
     font-weight: 700;
   }
-  .plus {
-    font-size: 20px;
-    color: var(--accent);
-    margin-right: 4px;
-  }
   .empty {
     margin: 10px 4px;
   }
   .new {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 10px;
+    margin-top: 16px;
+  }
+  .new-toggle {
+    width: 100%;
+    min-height: 52px;
+    padding: 0 16px;
+    text-align: left;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .new-body {
+    padding: 0 12px 12px;
   }
   .bar {
     position: fixed;
@@ -319,26 +328,15 @@
     z-index: 20;
     background: var(--surface);
     border-top: 1px solid var(--border);
-    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+  }
+  .go {
     display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .bar > .row,
-  .queue {
-    max-width: 528px;
     width: 100%;
-    margin: 0 auto;
-  }
-  .unknown {
-    margin: 0 auto;
     max-width: 528px;
-    width: 100%;
-  }
-  .queue {
-    list-style: none;
-    padding: 0;
-    max-height: 40dvh;
-    overflow-y: auto;
+    margin: 0 auto;
+    min-height: 64px;
+    font-size: 20px;
+    border-radius: 18px;
   }
 </style>
